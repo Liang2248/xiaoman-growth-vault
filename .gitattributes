@@ -1,0 +1,13 @@
+# start.bat 必须是 GBK 编码 + CRLF 换行，否则 cmd.exe 会解析出错。
+# 标记为二进制可让 git 原样存取，不做任何换行或编码转换。
+*.bat -text
+
+# 其余文本文件统一以 LF 存储
+*.py   text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.svg  text eol=lf
+*.txt  text eol=lf

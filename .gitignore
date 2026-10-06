@@ -1,0 +1,48 @@
+# ============================================================
+# 小满 · 成长证据库  .gitignore
+# 目标：源码进仓库，个人数据与运行痕迹一律留在本地。
+# ============================================================
+
+# ---- 个人数据（绝对不要上传）----
+# data/ 里有 vault.db（全部记录）、media/、thumbs/、backups/、logs/
+# 以及可能包含 AI Key 的设置，体量大且高度私密。
+data/
+
+# 兜底：任何位置的数据库文件
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ---- Python 运行环境与缓存 ----
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 开发与调试残留 ----
+.sandbox/
+.superpowers/
+.launching
+*.log
+
+# ---- 密钥与本地配置（以防万一）----
+.env
+.env.*
+*.pem
+*.key
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
