@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from . import logx
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 MEDIA_DIR = DATA_DIR / "media"
@@ -46,6 +48,10 @@ CREATE TABLE IF NOT EXISTS entries (
   deleted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_entries_occurred ON entries(occurred_at);
+-- A4-07：列表/统计统一写成 deleted_at IS NULL AND substr(occurred_at,1,10) 过滤，
+-- 只建在 occurred_at 上的索引被 substr() 包住后用不上，这里补一条与查询形态一致的索引。
+CREATE INDEX IF NOT EXISTS idx_entries_deleted ON entries(deleted_at);
+CREATE INDEX IF NOT EXISTS idx_entries_day ON entries(deleted_at, substr(occurred_at,1,10));
 
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY,
@@ -108,6 +114,7 @@ CREATE TABLE IF NOT EXISTS reports (
   entry_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS knowledge (
   id TEXT PRIMARY KEY,
@@ -122,6 +129,8 @@ CREATE TABLE IF NOT EXISTS knowledge (
   vector_json TEXT,
   created_at TEXT NOT NULL
 );
+-- A4-07：stats._knowledge_counts 固定按 status='accepted' GROUP BY type 聚合。
+CREATE INDEX IF NOT EXISTS idx_knowledge_status_type ON knowledge(status, type);
 
 CREATE TABLE IF NOT EXISTS goals (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -196,32 +205,49 @@ CREATE TABLE IF NOT EXISTS capsules (
   created_at TEXT NOT NULL,
   dismissed INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_capsules_unlock ON capsules(unlock_date);
 """
 
+# FTS5 外部内容表：列名必须与 entries 的实际列一一对应（tags，不是 tags_text）。
+# HANA-01：旧版本这里写成 tags_text，而 entries 里没有该列 —— FTS5 只校验列名个数，
+# 建表能成功，但 count(*)/列读取/rebuild 都会报 "no such column: T.tags_text"。
 FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-  title, summary, content, tags_text,
+  title, summary, content, tags,
   content='entries', content_rowid='rowid',
   tokenize='trigram'
 );
 CREATE TRIGGER IF NOT EXISTS entries_fts_i AFTER INSERT ON entries BEGIN
-  INSERT INTO entries_fts(rowid, title, summary, content, tags_text)
+  INSERT INTO entries_fts(rowid, title, summary, content, tags)
   VALUES (new.rowid, new.title, new.summary, new.content, new.tags);
 END;
 CREATE TRIGGER IF NOT EXISTS entries_fts_d AFTER DELETE ON entries BEGIN
-  INSERT INTO entries_fts(entries_fts, rowid, title, summary, content, tags_text)
+  INSERT INTO entries_fts(entries_fts, rowid, title, summary, content, tags)
   VALUES ('delete', old.rowid, old.title, old.summary, old.content, old.tags);
 END;
 CREATE TRIGGER IF NOT EXISTS entries_fts_u AFTER UPDATE ON entries BEGIN
-  INSERT INTO entries_fts(entries_fts, rowid, title, summary, content, tags_text)
+  INSERT INTO entries_fts(entries_fts, rowid, title, summary, content, tags)
   VALUES ('delete', old.rowid, old.title, old.summary, old.content, old.tags);
-  INSERT INTO entries_fts(rowid, title, summary, content, tags_text)
+  INSERT INTO entries_fts(rowid, title, summary, content, tags)
   VALUES (new.rowid, new.title, new.summary, new.content, new.tags);
 END;
 """
 
+# 重建虚表前必须先删掉的三个触发器（DROP TABLE 不会连带删触发器）。
+_FTS_TRIGGERS = ("entries_fts_i", "entries_fts_d", "entries_fts_u")
+# 已重建到修正版结构的标记，存 settings，避免每次启动重复检测。
+FTS_SCHEMA_VERSION = "2"
+_FTS_VERSION_KEY = "fts_schema_version"
+# A4-11：时区迁移指纹（存的是当时的本地时区名），相同则跳过全表重写。
+_TZ_MIGRATED_KEY = "timezone_migrated_tz"
+# A4-04：schema 版本锚点（PRAGMA user_version）。迁移本身仍靠逐列 PRAGMA 探测（幂等），
+# 这个版本号用于给未来"只跑一次"的迁移提供判断依据，并让备份能记录当前结构版本。
+SCHEMA_VERSION = 3
+
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
+_locked_depth = 0  # locked() 临界区嵌套深度，用于阻止块内 db.execute() 提前提交（A4-03）
+_fts_repaired_this_session = False  # FTS 自愈每进程只做一次，避免每次空搜索都重建
 fts_enabled = False
 
 
@@ -434,6 +460,25 @@ CREATE TABLE IF NOT EXISTS year_reviews (
     if "caption" not in acols:
         _conn.execute("ALTER TABLE attachments ADD COLUMN caption TEXT")
         _conn.commit()
+    # A4-09/A4-37：同一条记录内同 sha256 只允许一行（物理文件本就按 sha256 去重），
+    # 唯一索引让"多文件上传中途失败后整体重试"变幂等，而不是插出重复附件行。
+    # 先清掉存量重复行（保留最早一行，即 rowid 最小者），否则 CREATE UNIQUE INDEX 会失败。
+    try:
+        dup = _conn.execute(
+            "SELECT count(*) FROM attachments WHERE rowid NOT IN "
+            "(SELECT min(rowid) FROM attachments GROUP BY entry_id, sha256)").fetchone()[0]
+        if dup:
+            _conn.execute(
+                "DELETE FROM attachments WHERE rowid NOT IN "
+                "(SELECT min(rowid) FROM attachments GROUP BY entry_id, sha256)")
+            logx.log("已合并重复的附件行", f"{dup} 行为同一记录内重复引用同一文件（保留最早一行）")
+        _conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_entry_sha "
+            "ON attachments(entry_id, sha256)")
+    except sqlite3.Error as e:
+        # 老库可能有异常数据；唯一约束是增强项，失败不阻止启动。
+        logx.log("附件唯一约束创建失败", str(e))
+    _conn.commit()
     # 合并提案 / 主动提问
     _conn.execute("""
 CREATE TABLE IF NOT EXISTS merge_proposals (
@@ -513,6 +558,20 @@ CREATE TABLE IF NOT EXISTS entity_facts (
   created_at TEXT NOT NULL
 )""")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_entity ON entity_facts(entity_id)")
+    # A0-24：entity_facts 也要有与 entity_relations 同款的逐列补列。
+    # 早于 valid_to/source_entry_id/certainty 引入版本的库只有 CREATE TABLE IF NOT EXISTS，
+    # 不会补上这些列，而 temporal.py 会直接索引它们（sqlite3.Row 缺列抛 IndexError）。
+    fcols = {r[1] for r in _conn.execute("PRAGMA table_info(entity_facts)").fetchall()}
+    for col, ddl in (
+        ("valid_from", "ALTER TABLE entity_facts ADD COLUMN valid_from TEXT NOT NULL DEFAULT ''"),
+        ("valid_to", "ALTER TABLE entity_facts ADD COLUMN valid_to TEXT"),
+        ("certainty", "ALTER TABLE entity_facts ADD COLUMN certainty TEXT NOT NULL DEFAULT 'inferred'"),
+        ("source_entry_id", "ALTER TABLE entity_facts ADD COLUMN source_entry_id TEXT"),
+    ):
+        if col not in fcols:
+            _conn.execute(ddl)
+            fcols.add(col)
+    _conn.commit()
     # 成长路线证据与验收条件（旧库增量补列，保留已有节点）
     rcols = {r[1] for r in _conn.execute("PRAGMA table_info(roadmap_nodes)").fetchall()}
     for col, ddl in (
@@ -526,7 +585,8 @@ CREATE TABLE IF NOT EXISTS entity_facts (
     ):
         if col not in rcols:
             _conn.execute(ddl)
-            _conn.commit()
+            rcols.add(col)  # A4-14：与其他迁移循环保持一致，防重复 ALTER
+    _conn.commit()
     _conn.execute("""
 CREATE TABLE IF NOT EXISTS roadmap_checkins (
   id TEXT PRIMARY KEY,
@@ -558,6 +618,9 @@ CREATE TABLE IF NOT EXISTS link_proposals (
   decided_at TEXT,
   UNIQUE(entry_id, target_type, target_id)
 )""")
+    # A4-07：links_for_entry / circle 聚合固定按 (entry_id, status) 过滤提案。
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_link_proposals_entry "
+                  "ON link_proposals(entry_id, status)")
     # 一切 AI 自动动作的可逆日志（操作前快照存 detail_json，undone=1 表示已撤销）
     _conn.execute("""
 CREATE TABLE IF NOT EXISTS circle_auto_log (
@@ -608,34 +671,147 @@ def init_db() -> None:
     """启动时调用：建目录、建表、尝试创建 FTS。"""
     global _conn, fts_enabled
     ensure_dirs()
-    _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    self_check_warning = ""
+    _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
     _conn.row_factory = sqlite3.Row
     with _lock:
         _conn.execute("PRAGMA journal_mode=WAL")
+        # A4-05：默认 busy_timeout 为 0，拿不到锁立刻 FAIL；给 10 秒重试窗口，
+        # 与 connect(timeout=10) 等价，双实例/外部工具短暂占用不再直接 500。
+        _conn.execute("PRAGMA busy_timeout=10000")
         _conn.execute("PRAGMA foreign_keys=ON")
+        # A4-04：先确认这确实是个能打开的 SQLite 库。不是的话（被别的程序写坏、
+        # 根本不是库文件）给出中文原因，而不是让 executescript 抛英文栈。
+        try:
+            chk = _conn.execute("PRAGMA quick_check").fetchone()[0]
+        except sqlite3.DatabaseError as e:
+            raise RuntimeError(
+                f"数据库文件无法打开或已损坏（{DB_PATH}）：{str(e)[:200]}。"
+                f"请关闭小满后，用 data/backups 下最近的备份 zip 里的 vault.db 覆盖恢复。"
+            ) from e
+        if chk != "ok":
+            # 结构性问题只告警不阻断：数据保全应用必须还能启动起来导出/备份现有数据。
+            self_check_warning = str(chk)[:200]
+            logx.log("数据库自检未通过", f"{self_check_warning}（仍继续启动，建议尽快全量备份）")
         _conn.executescript(SCHEMA)
         _migrate()
         ensure_ai_provider_defaults()
+        if self_check_warning:
+            # 放到建表之后：此刻 settings 表一定存在，提示才能落库
+            push_notice("数据库自检发现异常，建议先在设置页做一次完整备份")
+        # A4-04：记录 schema 版本，给后续迁移一个显式的版本锚点
         try:
-            _conn.executescript(FTS_SCHEMA)
-            fts_enabled = True
+            if _conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                _conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         except sqlite3.Error:
+            pass
+        try:
+            _ensure_fts()
+            fts_enabled = True
+        except sqlite3.Error as e:
+            # A4-12：降级原因必须可见（缺 FTS5、SQLite < 3.34 无 trigram 等）
             fts_enabled = False
+            logx.log("全文检索降级", f"FTS5 不可用，3 字以上查询改走 LIKE：{e}")
         _conn.commit()
     seed_categories()
     _migrate_timezones()
+    if fts_enabled:
+        _fts_self_heal()
+
+
+def _ensure_fts() -> None:
+    """建/修 entries_fts 并保证索引与 entries 一致（幂等，可重跑）。
+
+    HANA-01：旧库的 entries_fts 用错列名 tags_text 建过，FTS5 建表不校验列名存在性，
+    于是 count(*)/列读取/rebuild 全报 "no such column: T.tags_text"，只有 MATCH 碰巧能用。
+    这里读 sqlite_master 的定义 SQL 做检测，是旧结构（或缺失）就整体重建 + rebuild。
+    """
+    sql = _conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='entries_fts'"
+    ).fetchone()
+    ddl = (sql["sql"] if sql else "") or ""
+    # 未记录过版本（全新库 / 老库）或 DDL 里还带着错误的 tags_text 列名 → 重建。
+    # 用 settings 里的版本标记是为了让"已经修过的库"每次启动都跳过这段检测。
+    flagged = get_setting(_FTS_VERSION_KEY) != FTS_SCHEMA_VERSION
+    stale = ("tags_text" in ddl) or (not ddl) or flagged
+    if stale:
+        for name in _FTS_TRIGGERS:
+            _conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        _conn.execute("DROP TABLE IF EXISTS entries_fts")
+        _conn.commit()
+    _conn.executescript(FTS_SCHEMA)
+    if stale:
+        # 重建后索引是空的：外部内容表必须显式 rebuild 才会把存量读进来。
+        _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+        set_setting(_FTS_VERSION_KEY, FTS_SCHEMA_VERSION)
+        _conn.commit()
+        logx.log("全文索引已重建",
+                 f"结构校对完成，共 {_conn.execute('SELECT count(*) FROM entries_fts').fetchone()[0]} 条已索引")
+
+
+def _fts_self_heal() -> None:
+    """A4-01/B + A4-13：启动时自检 FTS 索引，发现不一致就 rebuild（幂等、低成本）。
+
+    两个探测信号：
+    1. `(SELECT count(*) FROM entries_fts)` 与 `(SELECT count(*) FROM entries)` 不一致
+       —— 历史数据从未进索引、触发器写失败都会造成这种漂移；
+    2. FTS5 官方的 `integrity-check` 命令 —— 这是唯一能发现"影子表与外部内容表不同步"
+       的手段（`PRAGMA integrity_check` 不覆盖 FTS5 虚表）。
+    """
+    with _lock:
+        try:
+            indexed = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
+            live = _conn.execute("SELECT count(*) FROM entries").fetchone()[0]
+            broken = indexed != live
+            reason = f"索引 {indexed} 条 ≠ 记录 {live} 条"
+            if not broken:
+                try:
+                    _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
+                except sqlite3.Error as e:
+                    broken, reason = True, f"integrity-check 未通过：{e}"
+            if broken:
+                _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+                _conn.commit()
+                logx.log("全文索引已自愈", f"{reason}，已重建")
+        except sqlite3.Error as e:
+            # 自愈失败不影响启动：search_rowids 仍有 LIKE 兜底。
+            logx.log("全文索引自检未通过", f"{e}")
+
+
+def fts_status() -> dict:
+    """A4-12/A4-13：把全文索引状态暴露给诊断接口（设置页/健康检查用）。"""
+    if not fts_enabled:
+        return {"enabled": False, "detail": "FTS5 不可用，3 字以上查询走 LIKE"}
+    with _lock:
+        try:
+            indexed = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
+            live = _conn.execute("SELECT count(*) FROM entries").fetchone()[0]
+            _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
+            return {"enabled": True, "indexed": indexed, "entries": live,
+                    "consistent": indexed == live}
+        except sqlite3.Error as e:
+            return {"enabled": True, "consistent": False, "detail": str(e)}
 
 
 def _migrate_timezones() -> None:
     """老数据的 occurred_at 可能是 UTC 等非本地偏移（前端曾发 toISOString），
-    统一转成本地时区，保证 substr(occurred_at,1,10) 的本地日聚合正确。幂等，每次启动跑。"""
+    统一转成本地时区，保证 substr(occurred_at,1,10) 的本地日聚合正确。幂等，每次启动跑。
+
+    A4-11：全表重写最核心字段有风险，这里加时区指纹标记：时区没变且已迁移过就直接跳过，
+    避免每次启动都全表扫描 + 触发 FTS 更新触发器。"""
     local_tz = datetime.now().astimezone().tzinfo
+    tz_name = str(local_tz)
     with _lock:
+        if get_setting(_TZ_MIGRATED_KEY) == tz_name:
+            return
         rows = _conn.execute("SELECT id, occurred_at FROM entries").fetchall()
+        dirty = 0
         for r in rows:
             try:
                 dt = datetime.fromisoformat(r["occurred_at"])
             except (ValueError, TypeError):
+                # A4-11：无法解析的值原样保留，但记数并在启动后提示，不再完全静默。
+                dirty += 1
                 continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=local_tz)
@@ -645,6 +821,10 @@ def _migrate_timezones() -> None:
             if s != r["occurred_at"]:
                 _conn.execute("UPDATE entries SET occurred_at=? WHERE id=?", (s, r["id"]))
         _conn.commit()
+        set_setting(_TZ_MIGRATED_KEY, tz_name)
+    if dirty:
+        push_notice(f"有 {dirty} 条记录的时间格式无法识别，已原样保留，可在记录里手动修正")
+        logx.log("时间格式检查", f"{dirty} 条记录的 occurred_at 无法解析，已原样保留")
 
 
 def conn() -> sqlite3.Connection:
@@ -653,17 +833,76 @@ def conn() -> sqlite3.Connection:
     return _conn
 
 
+def close() -> None:
+    """A4-05：关停时收口 WAL 再关连接（lifespan 退出时调用）。
+
+    不做 checkpoint 的话，长时间运行后 vault.db-wal 会一直偏大。"""
+    global _conn
+    with _lock:
+        if _conn is None:
+            return
+        try:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        try:
+            _conn.close()
+        finally:
+            _conn = None
+
+
+def purge_orphan_rows() -> dict:
+    """A4-08：清理引用已硬删记录的孤儿行（启动时调用，幂等）。
+
+    knowledge/entity_mentions/entry_categories/link_proposals 四张表引用 entries 却没有
+    外键级联（新库已补 REFERENCES，老库 SQLite 不支持 ALTER ADD CONSTRAINT），
+    main.purge_old_deleted 硬删记录后它们会留下孤儿：entity_mentions 的孤儿会把
+    entities.mention_count 抬高，link_proposals 的孤儿会在关联列表里显示"（记录已删除）"。
+    """
+    counts: dict[str, int] = {}
+    with locked() as c:
+        for table in ("entity_mentions", "entry_categories", "link_proposals"):
+            # 用 NOT EXISTS 而不是 NOT IN：NOT IN 遇到子查询里的 NULL 会整体变成"无匹配"
+            # （静默不清理），NOT EXISTS 语义确定。
+            cur = c.execute(
+                f"DELETE FROM {table} WHERE entry_id IS NOT NULL "
+                f"AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = {table}.entry_id)")
+            counts[table] = max(cur.rowcount, 0)
+        # knowledge.entry_id 是"来源记录"软引用：只清空悬空指针，不删知识条目本身。
+        cur = c.execute(
+            "UPDATE knowledge SET entry_id=NULL WHERE entry_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = knowledge.entry_id)")
+        counts["knowledge_entry_id_nulled"] = max(cur.rowcount, 0)
+    if any(counts.values()):
+        logx.log("已清理孤儿数据行", "、".join(f"{k} {v} 行" for k, v in counts.items() if v))
+    return counts
+
+
 @contextmanager
 def locked():
-    """跨多条语句的复合操作时用：with locked() as c: ...（持锁且不自动提交）。
-    中途抛异常必须 rollback——否则半成品事务会被其他线程的下一次 commit 捎带落库。"""
+    """跨多条语句的复合操作时用：with locked() as c: ...（持锁，**成功即提交**）。
+
+    A4-02：事务由本上下文托管，成功路径也 commit——调用方漏写 c.commit() 不再会让
+    半成品事务滞留在连接里、被另一个线程的下一次 commit 捎带落库。
+    块内调用 db.execute()/db.q1() 是安全的：execute() 检测到临界区内只执行不提交
+    （并入本次事务），由本上下文统一提交。中途抛异常必须 rollback。"""
+    global _locked_depth
     with _lock:
         c = conn()
+        nested = _locked_depth > 0
+        _locked_depth += 1
         try:
             yield c
-        except Exception:
+        except BaseException:
+            # 块内抛异常（含生成器被外部 close 时的 GeneratorExit）一律回滚；
+            # 正常退出（含块内 return）走 else 分支提交。
             c.rollback()
             raise
+        else:
+            if not nested:
+                c.commit()
+        finally:
+            _locked_depth -= 1
 
 
 def q(sql: str, params=()) -> list[sqlite3.Row]:
@@ -679,7 +918,11 @@ def q1(sql: str, params=()) -> sqlite3.Row | None:
 def execute(sql: str, params=()) -> None:
     with _lock:
         conn().execute(sql, params)
-        conn().commit()
+        if _locked_depth == 0:
+            conn().commit()
+        else:
+            # A4-03：临界区内调用不再提前提交外层事务（旧行为会把复合写入做到一半落库）。
+            logx.log("数据层提示", "locked() 临界区内调用了 db.execute()，已并入外层事务")
 
 
 def now_iso() -> str:
@@ -796,20 +1039,44 @@ def ensure_ai_provider_defaults() -> None:
 
 def push_notice(text: str) -> None:
     """一次性轻提示队列（setting app_notice 存 JSON 数组）：多条共存不互顶，
-    GET /api/notice 一次取走全部。保留最近 20 条。"""
-    raw = get_setting("app_notice")
-    items: list = []
-    if raw:
-        try:
-            v = json.loads(raw)
-            items = v if isinstance(v, list) else [v]
-        except ValueError:
-            items = []
-    items.append({"text": text, "ts": now_iso()})
-    set_setting("app_notice", json.dumps(items[-20:], ensure_ascii=False))
+    GET /api/notice 一次取走全部。保留最近 20 条。
+
+    A4-10：整个读-改-写放在同一临界区（同一事务），避免两个后台线程各自基于同一份
+    旧列表覆盖写、丢掉其中一条提示。"""
+    with locked() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='app_notice'").fetchone()
+        items: list = []
+        if row and row["value"]:
+            try:
+                v = json.loads(row["value"])
+                items = v if isinstance(v, list) else [v]
+            except ValueError:
+                items = []
+        items.append({"text": text, "ts": now_iso()})
+        c.execute(
+            "INSERT INTO settings(key, value) VALUES('app_notice', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps(items[-20:], ensure_ascii=False),),
+        )
 
 
 # ---------------- 全文搜索 ----------------
+
+def _like_escape(s: str) -> str:
+    """A4-06：LIKE 的参数化只防注入、不防模式注入；用户查询里的 % 与 _ 必须转义。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _like_rowids(qs: str, limit: int) -> list[int]:
+    like = f"%{_like_escape(qs)}%"
+    rows = conn().execute(
+        "SELECT rowid FROM entries WHERE title LIKE ? ESCAPE '\\' "
+        "OR summary LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' "
+        "OR tags LIKE ? ESCAPE '\\' LIMIT ?",
+        (like, like, like, like, limit),
+    ).fetchall()
+    return [r[0] for r in rows]
+
 
 def search_rowids(query: str, limit: int = 500) -> list[int]:
     """返回匹配的 entries.rowid 列表。
@@ -817,25 +1084,41 @@ def search_rowids(query: str, limit: int = 500) -> list[int]:
     3 个及以上字符走 FTS5 trigram（子串匹配）；1~2 个汉字直接 LIKE
     （trigram 对短查询不可靠，LIKE 结果一定正确）；FTS 不可用时回退 LIKE。
     """
+    global fts_enabled, _fts_repaired_this_session
     qs = query.strip()
     if not qs:
         return []
     with _lock:
         if fts_enabled and len(qs) >= 3:
             try:
-                phrase = '"' + qs.replace('"', '""') + '"'
-                rows = conn().execute(
-                    "SELECT rowid FROM entries_fts WHERE entries_fts MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (phrase, limit),
-                ).fetchall()
-                return [r[0] for r in rows]
-            except sqlite3.Error:
-                pass
-        like = f"%{qs}%"
-        rows = conn().execute(
-            "SELECT rowid FROM entries WHERE title LIKE ? OR summary LIKE ? "
-            "OR content LIKE ? OR tags LIKE ? LIMIT ?",
-            (like, like, like, like, limit),
-        ).fetchall()
-        return [r[0] for r in rows]
+                hits = _fts_rowids(qs, limit)
+                if hits:
+                    return hits
+                # A4-01：空结果不等于没有匹配——索引缺失/漂移同样返回空集。
+                # 先用 LIKE 拿到正确结果，确认确有匹配时再自愈索引（每进程最多一次，
+                # 否则每次"搜不到"都要重建整表索引，代价不可接受）。
+                rows = _like_rowids(qs, limit)
+                if rows and not _fts_repaired_this_session:
+                    _fts_repaired_this_session = True
+                    try:
+                        conn().execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+                        conn().commit()
+                        logx.log("全文索引已自愈", "FTS 无结果但 LIKE 有命中，已重建索引")
+                    except sqlite3.Error as e:
+                        logx.log("全文索引重建失败", f"{e}（本次仍返回 LIKE 结果）")
+                return rows
+            except sqlite3.Error as e:
+                # 索引彻底不可用时永久降级到 LIKE，避免每次查询都白跑一次 FTS。
+                fts_enabled = False
+                logx.log("全文检索降级", f"FTS 查询失败，后续改走 LIKE：{e}")
+        return _like_rowids(qs, limit)
+
+
+def _fts_rowids(qs: str, limit: int) -> list[int]:
+    phrase = '"' + qs.replace('"', '""') + '"'
+    rows = conn().execute(
+        "SELECT rowid FROM entries_fts WHERE entries_fts MATCH ? "
+        "ORDER BY rank LIMIT ?",
+        (phrase, limit),
+    ).fetchall()
+    return [r[0] for r in rows]

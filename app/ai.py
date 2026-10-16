@@ -9,18 +9,33 @@ import hashlib
 import io
 import json
 import math
+import random
 import re
+import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
 
-from . import db, stats as stats_mod
+from . import db, logx, stats as stats_mod
 
 PROMPT_VERSION = "v2-evidence"
 KNOWLEDGE_TYPES = {"experience", "pitfall", "case", "sop", "skill"}
 HORIZONS = (30, 90, 180, 365)
+
+# 统一口径说明：所有"给 AI 看"的 entries 查询都必须带 exclude_from_ai=0
+# （主路径在 ai.py/stats.py 已遵循；insights.py / yearreview.py 的补漏见 A5-06）。
+# 知识语义判重的余弦阈值（与 _knowledge_dedupe_match 的文档保持一致）。
+KNOWLEDGE_DEDUPE_COS = 0.82
+
+# 共享连接池的限制：够"信号量 3"的并发复用，又不会无限开连接。
+_CLIENT_LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4)
+_client: httpx.Client | None = None
+_client_lock = threading.Lock()
+
+# AI 调用并发闸门：防止批量保存时"每条记录一个线程"自造 429。
+_AI_SEMAPHORE = threading.BoundedSemaphore(3)
 
 
 class AIError(Exception):
@@ -39,28 +54,178 @@ class InsufficientDataError(Exception):
 
 # ---------------- 基础调用 ----------------
 
+def _client_get() -> httpx.Client:
+    """模块级共享 httpx.Client：复用连接池，避免每次尝试重做 TCP+TLS 握手。"""
+    global _client
+    with _client_lock:
+        if _client is None or _client.is_closed:
+            _client = httpx.Client(limits=_CLIENT_LIMITS)
+        return _client
+
+
+def _split_timeout(timeout: float) -> httpx.Timeout:
+    """把调用方给的总读取预算拆成 connect/read/write/pool：connect 固定压到 10s，
+    避免 base_url 指向黑洞地址时一次连接就挂满整个预算。"""
+    read = max(1.0, float(timeout))
+    return httpx.Timeout(connect=min(10.0, read), read=read,
+                         write=min(30.0, read), pool=min(10.0, read))
+
+
+def _sleep_backoff(i: int, floor: float = 2.0) -> None:
+    """指数退避 + 抖动（可中断的短睡眠，便于进程退出时快速收敛）。"""
+    time.sleep(min(floor ** i, 8.0) + random.random())
+
+
+_IMAGE_PLACEHOLDER = "（图片已在上一次请求中提供，请仅按已识别内容输出 JSON）"
+
+
+def _text_only(messages: list) -> list:
+    """把消息里的图片内容替换成占位说明，只保留文本。
+
+    JSON 修复请求用它来避免重发最多 9 张 base64 图片（单次识别成本/耗时翻倍）。
+    """
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            texts = [str(c.get("text") or "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text"]
+            had_image = any(isinstance(c, dict) and c.get("type") == "image_url"
+                            for c in content)
+            text = "\n".join(t for t in texts if t)
+            if had_image:
+                text = (text + "\n" + _IMAGE_PLACEHOLDER).strip()
+            out.append({**m, "content": text})
+        else:
+            out.append(m)
+    return out
+
+
+_SECRET_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{6,}|Bearer\s+[A-Za-z0-9._\-]{6,}|"
+    r"(?:api[_-]?key|apikey|access[_-]?token|authorization)\"?\s*[:=]\s*\"?[^\s\"',}]{6,})",
+    re.IGNORECASE,
+)
+
+
+def _redact(text: str) -> str:
+    """抹掉上游错误体里可能的密钥/授权信息，只用于服务端诊断与日志。"""
+    return _SECRET_RE.sub("[已隐藏]", text or "")
+
+
+def _finite(value, default: float) -> float:
+    """把模型给的小数收敛为有限值：NaN/Infinity/非法一律回落 default。
+
+    注意 max(nan, 0.0) 在 Python 里仍是 nan，所以必须先做 isfinite 判定再钳制。
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _clamp01(value, default: float) -> float:
+    return min(max(_finite(value, default), 0.0), 1.0)
+
+
+def _reject_constant(name: str):
+    """json.loads 的 parse_constant：把 NaN/Infinity/-Infinity 挡在解析层。"""
+    raise ValueError(f"不接受的 JSON 常量：{name}")
+
+
+def _kv_complete(slot: str) -> bool:
+    """槽位的 KV 三件套是否配齐。"""
+    url_key, key_key, model_key = {
+        "fast": ("ai_fast_base_url", "ai_fast_key", "ai_fast_model"),
+        "strong": ("ai_base_url", "ai_key", "ai_model"),
+    }.get(slot, ("ai_base_url", "ai_key", "ai_model"))
+    return all(db.get_setting(k).strip() for k in (url_key, key_key, model_key))
+
+
+def _provider_complete(slot: str) -> bool:
+    """供应商表里是否有本槽位可用的（enabled 且三件套完整）供应商。"""
+    try:
+        return db.q1(
+            "SELECT id FROM ai_providers WHERE slot=? AND enabled=1 "
+            "AND trim(base_url)<>'' AND trim(api_key)<>'' AND trim(model)<>'' LIMIT 1",
+            (slot,),
+        ) is not None
+    except Exception:
+        return False
+
+
 def fast_configured() -> bool:
-    """小模型槽位三件套是否配齐。"""
-    return all(db.get_setting(k).strip()
-               for k in ("ai_fast_base_url", "ai_fast_key", "ai_fast_model"))
+    """小模型槽位三件套是否配齐（KV 或供应商表任一侧完整即算配齐）。
+
+    与 :func:`_candidates` 的判定口径保持一致：可用性判断与实际调用不再脱节（A5-25）。
+    """
+    return _kv_complete("fast") or _provider_complete("fast")
 
 
 def strong_configured() -> bool:
-    return all(db.get_setting(k).strip()
-               for k in ("ai_base_url", "ai_key", "ai_model"))
+    return _kv_complete("strong") or _provider_complete("strong")
 
 
 def _require_settings(slot: str = "strong") -> tuple[str, str, str, bool]:
     """取槽位配置。fast 未配齐（三缺任一）时回落 strong。"""
-    vision = db.get_setting("ai_vision") == "true"
-    if slot == "fast" and fast_configured():
-        return (db.get_setting("ai_fast_base_url").strip(),
-                db.get_setting("ai_fast_key").strip(),
-                db.get_setting("ai_fast_model").strip(), vision)
-    if strong_configured():
-        return (db.get_setting("ai_base_url").strip(),
-                db.get_setting("ai_key").strip(),
-                db.get_setting("ai_model").strip(), vision)
+    return _candidates(slot)[0]
+
+
+_KV_KEYS = {
+    "strong": ("ai_base_url", "ai_key", "ai_model", "ai_vision", "ai_effort"),
+    "fast": ("ai_fast_base_url", "ai_fast_key", "ai_fast_model", "ai_vision", "ai_fast_effort"),
+}
+
+
+def _candidates(slot: str = "strong") -> list[tuple[str, str, str, bool]]:
+    """调用层的供应商候选列表：当前设置在前，随后是同一槽位其它 enabled 且配置完整的供应商。
+
+    返回 [(base_url, key, model, vision)]，去重且最多 3 家。fast 槽位未配齐时
+    整体回落 strong（与 _require_settings 语义一致，保持原子性）。
+    """
+    slot = "strong" if slot == "fast" and not fast_configured() else slot
+    url_key, key_key, model_key, vision_key, _effort_key = _KV_KEYS.get(
+        slot, _KV_KEYS["strong"])
+    vision = db.get_setting(vision_key) == "true"
+
+    out: list[tuple[str, str, str, bool]] = []
+    seen: set[str] = set()
+
+    def add(base: str, key: str, model: str, vis: bool) -> None:
+        base, key, model = (base or "").strip(), (key or "").strip(), (model or "").strip()
+        if not (base and key and model):
+            return
+        rid = f"{base.rstrip('/')}|{model}"
+        if rid in seen:
+            return
+        seen.add(rid)
+        out.append((base, key, model, bool(vis)))
+
+    add(db.get_setting(url_key), db.get_setting(key_key),
+        db.get_setting(model_key), vision)
+    try:
+        active_id = db.get_setting(f"ai_active_{slot}")
+        if active_id:
+            row = db.ai_provider_row(active_id)
+            if row is not None:
+                add(row["base_url"], row["api_key"], row["model"], bool(row["vision"]))
+        for row in db.q(
+            "SELECT * FROM ai_providers WHERE slot=? AND enabled=1 "
+            "ORDER BY updated_at DESC, created_at DESC LIMIT 4",
+            (slot,),
+        ):
+            # 备用候选用自己的 vision 标记（只有第一候选的 vision 会被 _require_settings 使用）。
+            add(row["base_url"], row["api_key"], row["model"], bool(row["vision"]))
+    except Exception:
+        # 供应商表不可用（旧库/异常）时退化为单候选，不影响主流程。
+        pass
+
+    if out:
+        return out[:3]
+    # KV 与供应商表都没给出完整配置：保持旧文案，提示去设置页。
     raise AIError("请先在设置页配置 AI 接口（base_url、API Key、模型名称）")
 
 
@@ -138,77 +303,164 @@ def _chat_url(base_url: str) -> str:
     return b + "/chat/completions" if "/v1" in b else b + "/v1/chat/completions"
 
 
+_THINKING_KEYS = ("enable_thinking", "thinking_budget")
+# 上游 400 只有在确实抱怨思考参数时才降级重试，避免任何 400 都白打一次请求。
+_THINKING_400_HINTS = ("reasoning_effort", "enable_thinking", "thinking_budget",
+                       "unknown parameter", "unsupported", "extra fields",
+                       "unrecognized", "invalid parameter")
+#: 可跨供应商回退的状态码：限流、鉴权/权限、地址失效；5xx 也算（上游抖动）。
+#: 400（请求本身不合法）不回退，避免把坏请求打成轮询风暴。
+_FALLBACK_CODES = frozenset({401, 403, 404, 429})
+
+
+def _fallbackable(code: int) -> bool:
+    return code in _FALLBACK_CODES or code >= 500
+
+
+def _post_chat(base_url: str, key: str, payload: dict, timeout: float) -> httpx.Response:
+    with _AI_SEMAPHORE:
+        return _client_get().post(
+            _chat_url(base_url),
+            json=payload,
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=_split_timeout(timeout),
+        )
+
+
+def _chat_error_message(code: int) -> str:
+    """把 HTTP 状态码翻译成固定中文文案；上游原文一律不外抛（只进日志）。"""
+    if code in (401, 403):
+        return f"API Key 无效或没有权限（HTTP {code}），请检查设置"
+    if code == 404:
+        return "接口地址不存在（HTTP 404），请检查 base_url 是否填写正确"
+    if code == 429:
+        return "请求过于频繁，已被 AI 服务限流（HTTP 429），请稍后重试"
+    if code >= 500:
+        return f"AI 服务内部错误（HTTP {code}），请稍后重试"
+    return f"AI 接口返回错误（HTTP {code}），详情见设置页日志"
+
+
 def chat(messages: list, timeout: float = 180.0, slot: str = "strong", attempts: int = 3,
-         model_override: str | None = None) -> str:
-    """调用 chat completions，返回文本内容；网络层错误（超时/断连/SSL 中断）自动重试，
-    最终失败抛 AIError（中文）。中转服务偶发断连很常见，重试能挡掉大部分。
-    思考深度（reasoning_effort）按槽位设置下发；接口不认该参数（400）时自动降级重试。
-    model_override 用于设置页指定的专用模型（如润色模型），覆盖槽位模型。"""
-    base_url, key, model, _ = _require_settings(slot)
-    if model_override:
-        model = model_override
-    payload = {"model": model, "messages": messages, "temperature": 0.3}
+         model_override: str | None = None, max_tokens: int | None = None) -> str:
+    """调用 chat completions，返回文本内容。
+
+    网络层错误（超时/断连/SSL 中断）、429 与 5xx 都会按指数退避自动重试；
+    400 不重试；401/403/404 是凭证或地址问题，会切换到同槽位下一个 enabled
+    供应商再试（最多 3 家），全部失败才抛 AIError。
+    思考深度按槽位设置下发；接口不认该参数（400 且错误体点名）时才降级重试。
+    model_override 用于设置页指定的专用模型（如润色模型），覆盖槽位模型；
+    max_tokens 供 JSON 修复请求等场景限制输出长度。"""
+    candidates = _candidates(slot)
     effort_key = "ai_fast_effort" if slot == "fast" else "ai_effort"
     effort = db.get_setting(effort_key).strip()
-    payload.update(_reasoning_payload_for(base_url, model, effort))
-    r = None
-    last: httpx.HTTPError | None = None
     tries = max(1, attempts)
-    for i in range(tries):
+    last_error: AIError | None = None
+
+    for ci, (base_url, key, model, _) in enumerate(candidates):
+        if model_override:
+            model = model_override
+        payload = {"model": model, "messages": messages, "temperature": 0.3}
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        payload.update(_reasoning_payload_for(base_url, model, effort))
+        r, last, downgraded = None, None, False
+
+        for i in range(tries):
+            try:
+                r = _post_chat(base_url, key, payload, timeout)
+                last = None
+                break
+            except httpx.HTTPError as e:  # TimeoutException / ConnectError / SSL 中断等
+                last = e
+                if i < tries - 1:
+                    _sleep_backoff(i)
+        if last is not None:
+            # 网络层失败：换下一家候选继续，全部失败后再给出分类文案。
+            if isinstance(last, httpx.TimeoutException):
+                last_error = AIError(f"连接超时（已自动重试 {tries} 次），请检查 base_url 是否正确、网络是否可用")
+            elif isinstance(last, httpx.ConnectError):
+                last_error = AIError(f"无法连接到 AI 接口（已自动重试 {tries} 次），请检查 base_url 是否填写正确")
+            else:
+                last_error = AIError(f"网络请求失败（已自动重试 {tries} 次仍被中断）：{last}")
+            continue
+
+        # 限流与上游抖动：退避后重试，耗尽本家候选的尝试次数再换下一家。
+        if r.status_code == 429 or r.status_code >= 500:
+            retry_after = 0.0
+            try:
+                retry_after = float(r.headers.get("Retry-After") or 0)
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            for i in range(tries - 1):
+                if retry_after > 0:
+                    time.sleep(min(retry_after, 8.0))
+                else:
+                    _sleep_backoff(i)
+                try:
+                    r = _post_chat(base_url, key, payload, timeout)
+                except httpx.HTTPError:
+                    continue
+                if r.status_code != 429 and r.status_code < 500:
+                    break
+            if r.status_code != 200:
+                logx.log("AI 接口错误详情", f"HTTP {r.status_code} {_redact(r.text[:200])}")
+                retried = f"（已重试 {tries} 次）" if tries > 1 else ""
+                last_error = AIError(f"{_chat_error_message(r.status_code)}{retried}")
+                if _fallbackable(r.status_code):
+                    continue  # 可回退类错误：换下一家候选
+                raise last_error
+
+        # 兼容代理或旧版接口：仅在错误体确实点名思考参数时才降级重试。
+        if r.status_code == 400 and (
+                "reasoning_effort" in payload
+                or any(k in payload for k in _THINKING_KEYS)) and any(
+                hint in (r.text or "").lower() for hint in _THINKING_400_HINTS):
+            payload.pop("reasoning_effort", None)
+            for thinking_key in _THINKING_KEYS:
+                payload.pop(thinking_key, None)
+            try:
+                r = _post_chat(base_url, key, payload, timeout)
+                downgraded = True
+            except httpx.HTTPError as e:
+                last_error = AIError(f"网络请求失败：{e}")
+                continue
+
+        if r.status_code != 200:
+            # 上游原文只进本地日志（脱敏、截断），客户端拿固定文案（A5-05）。
+            logx.log("AI 接口错误详情",
+                     f"HTTP {r.status_code}（{base_url}，思考参数降级={downgraded}）"
+                     f" {_redact(r.text[:200])}")
+            last_error = AIError(_chat_error_message(r.status_code))
+            if _fallbackable(r.status_code) and ci < len(candidates) - 1:
+                logx.log("AI 供应商回退", f"{base_url} 返回 HTTP {r.status_code}，尝试备用供应商")
+                continue
+            raise last_error
+
         try:
-            with httpx.Client(timeout=timeout) as c:
-                r = c.post(
-                    _chat_url(base_url),
-                    json=payload,
-                    headers={"Authorization": f"Bearer {key}"},
-                )
-            last = None
-            break
-        except httpx.HTTPError as e:  # TimeoutException / ConnectError / SSL 中断等网络层错误
-            last = e
-            if i < tries - 1:
-                time.sleep(2 + i * 3)
-    if last is not None:
-        if isinstance(last, httpx.TimeoutException):
-            raise AIError(f"连接超时（已自动重试 {tries} 次），请检查 base_url 是否正确、网络是否可用")
-        if isinstance(last, httpx.ConnectError):
-            raise AIError(f"无法连接到 AI 接口（已自动重试 {tries} 次），请检查 base_url 是否填写正确")
-        raise AIError(f"网络请求失败（已自动重试 {tries} 次仍被中断）：{last}")
+            data = r.json()
+            msg = data["choices"][0]["message"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise AIError("AI 接口返回的数据格式无法识别")
+        if not isinstance(msg, dict):
+            raise AIError("AI 接口返回的数据格式无法识别")
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            # 模型确实没说话：明确报错，避免上层把它当成"解析失败"（A5-23）。
+            # 推理型模型可能把内容全放在 reasoning_content：不把它当作正文返回
+            # （会污染 JSON 解析与纯文本调用方的结果），但要让报错可诊断。
+            reasoning = str(msg.get("reasoning_content") or "").strip()
+            if reasoning:
+                raise AIError("AI 只返回了思考过程、没有返回正文（模型可能不支持当前参数，"
+                              "可在设置页更换模型或调小思考深度）")
+            raise AIError("AI 没有返回任何内容（模型可能不支持当前参数或输出被截断），请重试")
+        return content
 
-    # 兼容代理或旧版接口：不认识思考参数时逐级降级重试，避免换模型后整次调用失败。
-    thinking_keys = ("enable_thinking", "thinking_budget")
-    if r.status_code == 400 and (
-            "reasoning_effort" in payload or any(key in payload for key in thinking_keys)):
-        payload.pop("reasoning_effort", None)
-        for reasoning_key in thinking_keys:
-            payload.pop(reasoning_key, None)
-        try:
-            with httpx.Client(timeout=timeout) as c:
-                r = c.post(
-                    _chat_url(base_url),
-                    json=payload,
-                    headers={"Authorization": f"Bearer {key}"},
-                )
-        except httpx.HTTPError as e:
-            raise AIError(f"网络请求失败：{e}")
-
-    if r.status_code != 200:
-        code = r.status_code
-        if code in (401, 403):
-            raise AIError(f"API Key 无效或没有权限（HTTP {code}），请检查设置")
-        if code == 404:
-            raise AIError("接口地址不存在（HTTP 404），请检查 base_url 是否填写正确")
-        if code == 429:
-            raise AIError("请求过于频繁，已被 AI 服务限流（HTTP 429），请稍后重试")
-        if code >= 500:
-            raise AIError(f"AI 服务内部错误（HTTP {code}），请稍后重试")
-        body = r.text[:200]
-        raise AIError(f"AI 接口返回错误（HTTP {code}）：{body}")
-
-    try:
-        return r.json()["choices"][0]["message"]["content"] or ""
-    except (ValueError, KeyError, IndexError, TypeError):
-        raise AIError("AI 接口返回的数据格式无法识别")
+    if last_error is not None:
+        if len(candidates) > 1:
+            raise AIError(f"{last_error}（已尝试 {len(candidates)} 家供应商，请检查设置）")
+        raise last_error
+    logx.log("AI 调用失败", "所有候选供应商均未返回可用结果")
+    raise AIError("AI 调用失败，请稍后重试")
 
 
 def test_ai(slot: str = "strong") -> tuple[bool, str]:
@@ -223,23 +475,20 @@ def test_ai(slot: str = "strong") -> tuple[bool, str]:
 
 
 def _probe_error_message(code: int, body_text: str = "") -> str:
-    if code in (401, 403):
-        return f"API Key 无效或没有权限（HTTP {code}），请检查设置"
-    if code == 404:
-        return "接口地址不存在（HTTP 404），请检查 Base URL 是否填写正确"
-    if code == 429:
-        return "请求过于频繁，已被 AI 服务限流（HTTP 429），请稍后重试"
-    if code >= 500:
-        return f"AI 服务内部错误（HTTP {code}），请稍后重试"
-    return f"接口返回错误（HTTP {code}）：{body_text[:120]}"
+    """探测接口失败文案：一律固定中文，上游原文只进本地日志（脱敏、截断）。"""
+    if body_text:
+        logx.log("AI 探测接口错误详情", f"HTTP {code} {_redact(body_text[:200])}")
+    return _chat_error_message(code)
 
 
 def test_chat_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
     """用表单里的临时配置直接探测对话模型（不用先保存）。"""
     try:
         payload = {"model": model, "messages": [{"role": "user", "content": "回复ok两个字母"}], "temperature": 0.3}
-        with httpx.Client(timeout=20.0) as c:
-            r = c.post(_chat_url(base_url), json=payload, headers={"Authorization": f"Bearer {key}"})
+        with _AI_SEMAPHORE:
+            r = _client_get().post(_chat_url(base_url), json=payload,
+                                   headers={"Authorization": f"Bearer {key}"},
+                                   timeout=_split_timeout(20.0))
         if r.status_code != 200:
             return False, _probe_error_message(r.status_code, r.text)
         try:
@@ -258,9 +507,10 @@ def test_chat_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
 def test_embed_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
     """用表单里的临时配置直接探测嵌入模型（不用先保存）。"""
     try:
-        with httpx.Client(timeout=20.0) as c:
-            r = c.post(_embed_url(base_url), json={"model": model, "input": "测试"},
-                       headers={"Authorization": f"Bearer {key}"})
+        with _AI_SEMAPHORE:
+            r = _client_get().post(_embed_url(base_url), json={"model": model, "input": "测试"},
+                                   headers={"Authorization": f"Bearer {key}"},
+                                   timeout=_split_timeout(20.0))
         if r.status_code != 200:
             return False, _probe_error_message(r.status_code, r.text)
         try:
@@ -278,32 +528,67 @@ def test_embed_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
 
 # ---------------- JSON 解析与修复 ----------------
 
+def _tolerant_candidates(t: str) -> list[str]:
+    """给出一串"越来越宽松"的候选文本，供本地修复后重试解析。
+
+    依次尝试：剥掉尾逗号、截到最后一个完整 `}`、去掉未闭合的尾部片段。
+    这些覆盖了模型最常见的非 JSON 输出（首尾说明文字、尾逗号、被 max_tokens 截断）。
+    """
+    out = [t]
+    trimmed = re.sub(r",\s*([}\]])", r"\1", t)
+    if trimmed != t:
+        out.append(trimmed)
+    start = t.find("{")
+    if start != -1:
+        end = t.rfind("}")
+        if end > start:
+            out.append(t[start:end + 1])
+        # 半截 JSON：从第一个 `{` 开始，逐个"在更早的收尾括号处截断"重试。
+        head = t[start:]
+        cuts = sorted({i for i, ch in enumerate(head) if ch in "}]"}, reverse=True)
+        out.extend(head[:cut + 1] for cut in cuts[:40])
+    # 全角引号/全角逗号在中文模型输出里很常见
+    normalized = t.replace("“", '"').replace("”", '"').replace("，", ",")
+    if normalized != t:
+        out.append(normalized)
+    return out
+
+
 def _extract_json(text: str):
-    t = text.strip()
+    t = (text or "").strip()
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t)
         t = re.sub(r"\s*```\s*$", "", t)
-    try:
-        return json.loads(t)
-    except ValueError:
-        start, end = t.find("{"), t.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(t[start:end + 1])
-        raise ValueError("响应不是合法 JSON")
+    last_error: Exception | None = None
+    for cand in _tolerant_candidates(t):
+        try:
+            return json.loads(cand, parse_constant=_reject_constant)
+        except ValueError as e:
+            last_error = e
+    raise ValueError("响应不是合法 JSON") from last_error
 
 
 def _chat_json(messages: list, slot: str = "strong", model_override: str | None = None):
-    """调模型并解析 JSON；失败时发起一次修复请求，再失败抛 AIError。"""
+    """调模型并解析 JSON；失败时发起一次修复请求，再失败抛 AIError。
+
+    修复请求只重发文本部分（图片替换为占位说明），并给更短超时、更小 max_tokens。
+    """
     raw = chat(messages, slot=slot, model_override=model_override)
     try:
         return _extract_json(raw)
     except ValueError:
         pass
-    repair = messages + [
-        {"role": "assistant", "content": raw},
+    plain = _text_only(messages)
+    # 保留开头的 system 指令 + 最近几轮，避免整段上下文（尤其是图片）重发。
+    system_head = (plain[:1] if plain and isinstance(plain[0], dict)
+                   and plain[0].get("role") == "system" else [])
+    repair = system_head + plain[len(system_head):][-6:]
+    repair += [
+        {"role": "assistant", "content": raw[:8000]},
         {"role": "user", "content": "上次输出不是合法JSON，请只输出JSON"},
     ]
-    raw2 = chat(repair, slot=slot, model_override=model_override)
+    raw2 = chat(repair, timeout=60.0, slot=slot, attempts=2,
+                model_override=model_override, max_tokens=2048)
     try:
         return _extract_json(raw2)
     except ValueError:
@@ -311,13 +596,38 @@ def _chat_json(messages: list, slot: str = "strong", model_override: str | None 
 
 
 def _str_list(value) -> list[str]:
-    """把 AI 返回的列表清洗为字符串数组；宽容处理 {text/title/content} 对象项。"""
+    """把 AI 返回的列表清洗为字符串数组；宽容处理 {text/title/content/entry_id/id} 对象项。"""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for x in value:
+        if x is None:
+            continue
+        if isinstance(x, dict):
+            x = (x.get("text") or x.get("title") or x.get("content")
+                 or x.get("entry_id") or x.get("id") or "")
+        if isinstance(x, bool) or not isinstance(x, (str, int, float)):
+            continue  # 容器/布尔值不做字符串化，避免产出 "{'a': 1}" / "True"
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _id_list(value) -> list[str]:
+    """专门清洗"id 数组"字段（highlights / evidence_entry_ids）。
+
+    模型常把 id 数组写成对象数组（[{"entry_id": "x"}]），此处统一取出来，
+    否则整批高光会被静默丢弃。
+    """
     if not isinstance(value, list):
         return []
     out = []
     for x in value:
         if isinstance(x, dict):
-            x = x.get("text") or x.get("title") or x.get("content") or ""
+            x = x.get("entry_id") or x.get("id") or x.get("entryId") or ""
+        if x is None or isinstance(x, bool):
+            continue
         s = str(x).strip()
         if s:
             out.append(s)
@@ -513,6 +823,32 @@ def _fmt_weather(w: dict | None) -> str:
     return " ".join(p for p in parts if p)
 
 
+class _LazySources:
+    """entry_id → 可逐字核验原文的惰性映射。
+
+    只为真正参与校验的 entry_id 读取附件文件；直接对全部记录构建字典会让
+    「放宽到全量记录」的路径做数千次 SQL 与文件 I/O（见 A5-24）。
+    接口刻意与 dict 兼容：`in` / `get` / `[]`。
+    """
+
+    def __init__(self, rows: list):
+        self._rows = {r["id"]: r for r in rows}
+        self._cache: dict[str, str] = {}
+
+    def __contains__(self, entry_id) -> bool:
+        return entry_id in self._rows
+
+    def get(self, entry_id, default: str = "") -> str:
+        if entry_id not in self._rows:
+            return default
+        return self[entry_id]
+
+    def __getitem__(self, entry_id) -> str:
+        if entry_id not in self._cache:
+            self._cache[entry_id] = _entry_verifiable_text(self._rows[entry_id])
+        return self._cache[entry_id]
+
+
 def _entry_verifiable_text(row) -> str:
     """返回一条记录可逐字核验的文本来源，包含受支持的文本附件摘录。"""
     parts = [str(row[key] or "") for key in ("title", "summary", "content")]
@@ -532,82 +868,163 @@ def _entry_verifiable_text(row) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def _entries_text(rows: list) -> str:
-    weekdays = "一二三四五六日"
-    blocks = []
-    for r in rows:
-        lines = [f"[记录 entry_id={r['id']}]"]
-        when = r['occurred_at'][:16].replace('T', ' ')
-        try:
-            wd = date.fromisoformat(r['occurred_at'][:10])
-            when += f"（周{weekdays[wd.weekday()]}）"
-        except ValueError:
-            pass
-        lines.append(f"时间：{when}")
-        meta = [f"分类：{CATEGORY_LABEL.get(r['category'], r['category'])}"]
-        try:
-            tags = json.loads(r["tags"] or "[]")
-        except ValueError:
-            tags = []
-        if tags:
-            meta.append("标签：" + "、".join(str(t) for t in tags))
-        lines.append(" | ".join(meta))
-        loc_w = []
-        if r["location_name"]:
-            loc_w.append(f"地点：{r['location_name']}")
-        try:
-            w = json.loads(r["weather_json"]) if r["weather_json"] else None
-        except ValueError:
-            w = None
-        wtext = _fmt_weather(w)
-        if wtext:
-            loc_w.append(f"天气：{wtext}")
-        if loc_w:
-            lines.append(" | ".join(loc_w))
-        if r["title"]:
-            lines.append(f"标题：{r['title']}")
-        if r["summary"]:
-            lines.append(f"摘要：{r['summary']}")
-        content = (r["content"] or "")[:2000]
-        if content:
-            lines.append(f"正文：\n{content}")
-        atts = db.q(
-            "SELECT filename, kind, duration_ms, path, size FROM attachments WHERE entry_id=? ORDER BY created_at",
-            (r["id"],),
-        )
-        if atts:
-            desc = []
-            for a in atts:
-                d = f"{a['filename']}({a['kind']}"
-                if a["duration_ms"]:
-                    d += f"，时长{round(a['duration_ms'] / 1000)}秒"
-                desc.append(d + ")")
-            lines.append("附件：" + "；".join(desc))
-            # 文本类附件直接附上内容摘录，AI 报告/总结能真正读到文件
-            for a in atts:
-                ext = Path(a["filename"] or "").suffix.lower()
-                if ext not in TEXT_FILE_EXTS or (a["size"] or 0) > 200_000:
-                    continue
-                try:
-                    raw = (db.MEDIA_DIR / a["path"]).read_bytes()[:12000]
-                    txt = raw.decode("utf-8", errors="replace").strip()
-                except Exception:
-                    txt = ""
-                if txt:
-                    lines.append(f"附件《{a['filename']}》内容摘录：\n{txt[:3000]}")
-        links = db.q("SELECT url, title FROM links WHERE entry_id=? ORDER BY created_at", (r["id"],))
-        for l in links:
-            lines.append(f"链接：{l['title'] or l['url']}（{l['url']}）")
-        blocks.append("\n".join(lines))
+ENTRIES_TEXT_BUDGET = 24000
 
-    text, used = [], 0
-    for i, b in enumerate(blocks):
-        if used + len(b) > 24000:
-            text.append(f"（其余 {len(blocks) - i} 条记录因长度限制省略）")
-            break
-        text.append(b)
-        used += len(b)
-    return "\n---\n".join(text)
+
+def _entry_block(r) -> str:
+    """把一条记录渲染成 prompt 里的一个文本块。"""
+    weekdays = "一二三四五六日"
+    lines = [f"[记录 entry_id={r['id']}]"]
+    when = r['occurred_at'][:16].replace('T', ' ')
+    try:
+        wd = date.fromisoformat(r['occurred_at'][:10])
+        when += f"（周{weekdays[wd.weekday()]}）"
+    except ValueError:
+        pass
+    lines.append(f"时间：{when}")
+    meta = [f"分类：{CATEGORY_LABEL.get(r['category'], r['category'])}"]
+    try:
+        tags = json.loads(r["tags"] or "[]")
+    except ValueError:
+        tags = []
+    if tags:
+        meta.append("标签：" + "、".join(str(t) for t in tags))
+    lines.append(" | ".join(meta))
+    loc_w = []
+    if r["location_name"]:
+        loc_w.append(f"地点：{r['location_name']}")
+    try:
+        w = json.loads(r["weather_json"]) if r["weather_json"] else None
+    except ValueError:
+        w = None
+    wtext = _fmt_weather(w)
+    if wtext:
+        loc_w.append(f"天气：{wtext}")
+    if loc_w:
+        lines.append(" | ".join(loc_w))
+    if r["title"]:
+        lines.append(f"标题：{r['title']}")
+    if r["summary"]:
+        lines.append(f"摘要：{r['summary']}")
+    content = (r["content"] or "")[:2000]
+    if content:
+        lines.append(f"正文：\n{content}")
+    atts = db.q(
+        "SELECT filename, kind, duration_ms, path, size FROM attachments WHERE entry_id=? ORDER BY created_at",
+        (r["id"],),
+    )
+    if atts:
+        desc = []
+        for a in atts:
+            d = f"{a['filename']}({a['kind']}"
+            if a["duration_ms"]:
+                d += f"，时长{round(a['duration_ms'] / 1000)}秒"
+            desc.append(d + ")")
+        lines.append("附件：" + "；".join(desc))
+        # 文本类附件直接附上内容摘录，AI 报告/总结能真正读到文件
+        for a in atts:
+            ext = Path(a["filename"] or "").suffix.lower()
+            if ext not in TEXT_FILE_EXTS or (a["size"] or 0) > 200_000:
+                continue
+            try:
+                raw = (db.MEDIA_DIR / a["path"]).read_bytes()[:12000]
+                txt = raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                txt = ""
+            if txt:
+                lines.append(f"附件《{a['filename']}》内容摘录：\n{txt[:3000]}")
+    links = db.q("SELECT url, title FROM links WHERE entry_id=? ORDER BY created_at", (r["id"],))
+    for l in links:
+        lines.append(f"链接：{l['title'] or l['url']}（{l['url']}）")
+    return "\n".join(lines)
+
+
+def _select_blocks(blocks: list[str], dates: list[str],
+                   budget: int, keep_latest: bool) -> tuple[list[int], int]:
+    """在字符预算内挑选要纳入 prompt 的记录下标。
+
+    - keep_latest=True（成长现状总结）：从最新一条反向填充，**保留最新**、丢最早的；
+    - 否则（周期报告）：先按天分配配额（保证每个有记录的日子都在上下文里有代表），
+      再用剩余预算按"最新优先"补齐。与 prompt 里"按时间顺序"的声明不冲突。
+    返回（升序下标列表，被省略条数）。
+    """
+    n = len(blocks)
+    if sum(len(b) for b in blocks) <= budget:
+        return list(range(n)), 0
+
+    if keep_latest:
+        chosen, used = [], 0
+        for i in range(n - 1, -1, -1):
+            if used + len(blocks[i]) > budget:
+                break
+            chosen.append(i)
+            used += len(blocks[i])
+        if not chosen and n:
+            chosen = [n - 1]  # 单块超预算时至少纳入最新的一条
+        return sorted(chosen), n - len(chosen)
+
+    by_day: dict[str, list[int]] = {}
+    for i, d in enumerate(dates):
+        by_day.setdefault(d, []).append(i)
+    days = list(by_day)
+    quota = max(800, budget // max(1, len(days)))
+    chosen: set[int] = set()
+    used = 0
+    for d in days:
+        spent = 0
+        picked: list[int] = []
+        for i in reversed(by_day[d]):   # 同一天内先纳入较晚的记录
+            size = len(blocks[i])
+            if picked and (spent + size > quota or used + spent + size > budget):
+                break
+            if not picked and used + size > budget:
+                break
+            picked.append(i)
+            spent += size
+        for i in picked:
+            chosen.add(i)
+        used += spent
+    for i in range(n - 1, -1, -1):     # 剩余预算按最新优先补齐
+        if i in chosen:
+            continue
+        if used + len(blocks[i]) <= budget:
+            chosen.add(i)
+            used += len(blocks[i])
+    if not chosen and n:
+        # 单块就超预算的极端情况：至少纳入最新的一条，别把上下文清空。
+        chosen = {n - 1}
+    return sorted(chosen), n - len(chosen)
+
+
+def _entries_text(rows: list, keep_latest: bool = False) -> tuple[str, dict]:
+    """把记录拼成 prompt 文本，返回（文本，本次纳入情况）。
+
+    超预算时的丢弃方向跟随业务语义：成长现状总结保留最新（keep_latest=True），
+    周期报告按天配额均匀采样。文本开头如实写明"实际纳入几条、省略几条、
+    覆盖哪些日期"，避免模型被告知"有 N 条"却只读到一部分而做无据推断。
+    调用方按 occurred_at 升序传入 rows。
+    """
+    blocks = [_entry_block(r) for r in rows]
+    dates = [r["occurred_at"][:10] for r in rows]
+    chosen, omitted = _select_blocks(blocks, dates, ENTRIES_TEXT_BUDGET, keep_latest)
+    picked_days = sorted({dates[i] for i in chosen})
+
+    header = []
+    if omitted:
+        if keep_latest:
+            header.append(f"（本条记录集共 {len(blocks)} 条，因长度限制只保留其中最新的 "
+                          f"{len(chosen)} 条，已省略 {omitted} 条更早的记录；"
+                          f"请不要对未列出的记录做任何推断）")
+        else:
+            # 周期报告：按天配额抽样（每个有记录的日子至少一条），并在下方如实列出
+            # 包含的日期，避免模型对未见到的日子做推断（A5-03）。
+            header.append(f"（本周期共 {len(blocks)} 条记录，因长度限制按「每个有记录的日子"
+                          f"至少保留一条」的方式采样，实际纳入 {len(chosen)} 条、"
+                          f"省略 {omitted} 条；未列出的记录请不要做任何推断）")
+        header.append("本次实际包含的日期：" + "、".join(picked_days))
+    body = "\n---\n".join(blocks[i] for i in chosen)
+    text = "\n".join(header + [body]) if header else body
+    return text, {"included": len(chosen), "omitted": omitted, "dates": picked_days}
 
 
 def _vision_content(entry_ids: list[str], user_text: str) -> list:
@@ -690,10 +1107,19 @@ def generate_report(rtype: str, day_str: str) -> dict:
         gaps = [d for d in all_days if d not in days_with]
         if gaps:
             gap_info = f"\n无记录的空白日（这些日子不要写任何事）：{'、'.join(gaps)}"
+    entries_text, included = _entries_text(rows)
+    if included["omitted"]:
+        # 超预算时有省略：如实声明实际纳入的范围，不再要求"读完全部记录"。
+        records_line = (f"以下是按时间顺序排列的记录（共 {len(rows)} 条，本提示实际纳入 "
+                        f"{included['included']} 条、省略 {included['omitted']} 条，"
+                        f"省略原因只是长度限制），请先读完全部列出内容，再按系统要求的顺序输出 JSON：")
+    else:
+        records_line = (f"以下是按时间顺序排列的 {len(rows)} 条记录，"
+                        f"请先读完全部记录，再按系统要求的顺序输出 JSON：")
     user_text = (
         f"时间段：{start.isoformat()} 至 {end.isoformat()}（{TYPE_LABEL[rtype]}，共 {total_days} 天，"
         f"其中有记录 {len(days_with)} 天）。{gap_info}\n"
-        f"以下是按时间顺序排列的 {len(rows)} 条记录，请先读完全部记录，再按系统要求的顺序输出 JSON：\n\n{_entries_text(rows)}"
+        f"{records_line}\n\n{entries_text}"
     )
     # 周报/月报：work_related=1 且非工作的记录作为「相关素材」附在工作记录之后，不混入工作统计
     if rtype in ("weekly", "monthly"):
@@ -730,7 +1156,7 @@ def generate_report(rtype: str, day_str: str) -> dict:
         raise AIError("AI 返回的内容结构不正确，请重试")
 
     valid_ids = {r["id"] for r in rows}
-    source_by_id = {r["id"]: _entry_verifiable_text(r) for r in rows}
+    source_by_id = _LazySources(rows)
     analysis = {
         "timeline_facts": [],
         "context_notes": None,
@@ -743,15 +1169,23 @@ def generate_report(rtype: str, day_str: str) -> dict:
         "mindmap_mermaid": None,
         "recurring": [],
     }
-    # AI 自动圈定高光：只标星、永不取消；entry_id 必须属于本期记录
+    # AI 自动圈定高光：只标星、永不取消；entry_id 必须属于本期记录。
+    # 这里只做"收集"，真正的 UPDATE 放到报告写入成功之后（A5-08：不让 AI 的
+    # 加星先于报告落库，导致报告失败却已改写用户可见的 starred）。
     new_highlights = []
-    for hid in _str_list(data.get("highlights"))[:3]:
-        if hid in valid_ids:
+    star_ids: list[str] = []
+    raw_highlights = data.get("highlights")
+    for hid in _id_list(raw_highlights)[:3]:
+        if hid in valid_ids and hid not in star_ids:
             row = db.q1("SELECT starred, title, content FROM entries WHERE id=?", (hid,))
             if row is not None:
                 if not row["starred"]:
                     new_highlights.append({"id": hid, "title": row["title"] or (row["content"] or "")[:20]})
-                db.execute("UPDATE entries SET starred=1 WHERE id=?", (hid,))
+                star_ids.append(hid)
+    if raw_highlights and not star_ids:
+        # 模型给了高光但一个都没通过校验：留痕，避免静默失效无法诊断（A5-19）。
+        logx.log(f"{TYPE_LABEL[rtype]}高光未采纳",
+                 f"AI 给出 {len(_id_list(raw_highlights))} 个 entry_id，0 个属于本期记录")
     # 原子事实清单：entry_id 必须属于本期记录，日期必须在周期内，否则丢弃
     for item in data.get("timeline_facts") or []:
         if isinstance(item, dict):
@@ -788,10 +1222,12 @@ def generate_report(rtype: str, day_str: str) -> dict:
         (rtype, start.isoformat(), end.isoformat()),
     )
     report_id = old["id"] if old is not None else db.new_id()
+    created_at = db.now_iso()
 
-    # 知识条目落库：按规范化标题去重，pending 更新、已审跳过、新增计 pending。
-    # 只有经过 entry_id + 原文 quote 校验的证据才会成为可点击来源。
-    knowledge_extracted = 0
+    # 知识条目：先在事务外把需要网络的判重（嵌入调用）批量算完，事务内只留本地语句
+    # （A5-08/A5-17）。批量嵌入把最多 10 次串行 HTTP 收敛为 1 次请求。
+    planned: list[dict] = []
+    candidates: list[dict] = []
     items = data.get("knowledge_items")
     if isinstance(items, list):
         for item in items[:10]:
@@ -823,27 +1259,70 @@ def generate_report(rtype: str, day_str: str) -> dict:
             if not evidence and raw_evidence:
                 # 模型给了来源但来源无法核验：宁可不入库，也不留下假链接。
                 continue
-            existing, vec = _knowledge_dedupe_match(ktype, title, content)
-            vec_json = json.dumps(vec) if vec is not None else None
+            candidates.append({"ktype": ktype, "title": title, "content": content,
+                               "evidence": evidence})
+
+    # 已配置嵌入时，向量由上面的批量请求一次性决定（哪怕失败返回 None）：
+    # vec_ready=True 让判重不再逐条发起网络调用，失败直接退到 bigram 兜底。
+    vec_ready = bool(candidates) and embed_configured()
+    vec_list: list[list[float] | None] = []
+    if vec_ready:
+        try:
+            vec_list = embed_texts([f"{c['title']}\n{c['content'][:200]}" for c in candidates])
+        except Exception:
+            vec_list = []
+    for i, cand in enumerate(candidates):
+        vec = vec_list[i] if i < len(vec_list) else None
+        try:
+            existing, vec = _knowledge_dedupe_match(
+                cand["ktype"], cand["title"], cand["content"],
+                vec=vec, vec_ready=vec_ready)
+        except AIError:
+            # 判重意外失败不应中断整份报告：退化为新增一条待审知识。
+            existing, vec = None, vec
+        planned.append({**cand, "existing": existing,
+                        "vec_json": json.dumps(vec) if vec is not None else None})
+
+    # 报告与知识条目同一个事务：先写报告（消除孤儿 source_report_id），再落知识（A5-08）。
+    knowledge_extracted = 0
+    analysis_json = json.dumps({**analysis, "_knowledge_extracted": 0}, ensure_ascii=False)
+    with db.locked() as c:
+        # 事务内不出现任何网络调用，只做本地 SQL。
+        if old is not None:
+            c.execute(
+                "UPDATE reports SET analysis_json=?, model=?, prompt_version=?, source_hash=?, "
+                "entry_count=?, created_at=? WHERE id=?",
+                (analysis_json, model, PROMPT_VERSION, source_hash, len(rows), created_at, report_id),
+            )
+        else:
+            c.execute(
+                "INSERT INTO reports(id, type, period_start, period_end, analysis_json, model, "
+                "prompt_version, source_hash, entry_count, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (report_id, rtype, start.isoformat(), end.isoformat(),
+                 analysis_json, model, PROMPT_VERSION, source_hash, len(rows), created_at),
+            )
+        for p in planned:
+            existing = p["existing"]
+            evidence = p["evidence"]
             if existing is not None:
                 if existing["status"] == "pending":
                     if evidence:
-                        db.execute(
+                        c.execute(
                             "UPDATE knowledge SET content=?, type=?, entry_id=?, source_report_id=?, evidence_json=?, vector_json=? WHERE id=?",
-                            (content, ktype, evidence[0]["entry_id"], report_id,
-                             json.dumps(evidence, ensure_ascii=False), vec_json, existing["id"]),
+                            (p["content"], p["ktype"], evidence[0]["entry_id"], report_id,
+                             json.dumps(evidence, ensure_ascii=False), p["vec_json"], existing["id"]),
                         )
                     else:
                         # 没有来源字段时仍保留知识，但只回链生成它的报告，
                         # 不覆盖已有的具体记录证据。
-                        db.execute(
+                        c.execute(
                             "UPDATE knowledge SET content=?, type=?, source_report_id=?, vector_json=? WHERE id=?",
-                            (content, ktype, report_id, vec_json, existing["id"]),
+                            (p["content"], p["ktype"], report_id, p["vec_json"], existing["id"]),
                         )
                     knowledge_extracted += 1
                 elif evidence:
                     # 已审核条目不改内容/状态，但补齐最近一次可核验来源。
-                    db.execute(
+                    c.execute(
                         "UPDATE knowledge SET entry_id=?, source_report_id=?, evidence_json=? WHERE id=?",
                         (evidence[0]["entry_id"], report_id,
                          json.dumps(evidence, ensure_ascii=False), existing["id"]),
@@ -852,31 +1331,22 @@ def generate_report(rtype: str, day_str: str) -> dict:
                 continue
             entry_id = evidence[0]["entry_id"] if evidence else None
             evidence_json = json.dumps(evidence, ensure_ascii=False)
-            db.execute(
+            c.execute(
                 "INSERT INTO knowledge(id, entry_id, source_report_id, evidence_json, type, title, content, status, dedupe_key, "
                 "vector_json, created_at) VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
-                (db.new_id(), entry_id, report_id, evidence_json, ktype, title, content,
-                 db.knowledge_dedupe_key(title), vec_json, db.now_iso()),
+                (db.new_id(), entry_id, report_id, evidence_json, p["ktype"], p["title"], p["content"],
+                 db.knowledge_dedupe_key(p["title"]), p["vec_json"], db.now_iso()),
             )
             knowledge_extracted += 1
+        if knowledge_extracted != 0:
+            analysis_json = json.dumps({**analysis, "_knowledge_extracted": knowledge_extracted},
+                                       ensure_ascii=False)
+            c.execute("UPDATE reports SET analysis_json=? WHERE id=?", (analysis_json, report_id))
+        c.commit()
 
-    # 同周期报告重新生成 = 覆盖而非新增（id 不变）
-    created_at = db.now_iso()
-    analysis_json = json.dumps({**analysis, "_knowledge_extracted": knowledge_extracted},
-                               ensure_ascii=False)
-    if old is not None:
-        db.execute(
-            "UPDATE reports SET analysis_json=?, model=?, prompt_version=?, source_hash=?, "
-            "entry_count=?, created_at=? WHERE id=?",
-            (analysis_json, model, PROMPT_VERSION, source_hash, len(rows), created_at, report_id),
-        )
-    else:
-        db.execute(
-            "INSERT INTO reports(id, type, period_start, period_end, analysis_json, model, "
-            "prompt_version, source_hash, entry_count, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (report_id, rtype, start.isoformat(), end.isoformat(),
-             analysis_json, model, PROMPT_VERSION, source_hash, len(rows), created_at),
-        )
+    # 报告已成功提交，此时才执行 AI 圈定的加星（A5-08）。
+    for hid in star_ids:
+        db.execute("UPDATE entries SET starred=1 WHERE id=? AND starred=0", (hid,))
     return {
         "id": report_id,
         "type": rtype,
@@ -981,7 +1451,7 @@ def generate_roadmap(direction: str) -> None:
         except (TypeError, ValueError):
             horizon = 30
         horizon = min(HORIZONS, key=lambda h: abs(h - horizon))
-        evidence = [str(x) for x in (item.get("evidence_entry_ids") or []) if str(x) in valid_ids][:3]
+        evidence = [x for x in _id_list(item.get("evidence_entry_ids")) if x in valid_ids][:3]
         valid.append((title, str(item.get("description") or "").strip(), horizon,
                       str(item.get("first_step") or "").strip()[:120],
                       str(item.get("done_when") or "").strip()[:160], evidence))
@@ -1026,6 +1496,8 @@ def generate_forecast() -> dict:
 
     s = dict(inputs["stats"])
     counts = [int(w.get("count") or 0) for w in s.get("weekly_counts", [])]
+    active_weeks = sum(1 for c in counts if c > 0)
+    zero_weeks = len(counts) - active_weeks
     if counts:
         mean = sum(counts) / len(counts)
         variance = sum((x - mean) ** 2 for x in counts) / max(len(counts), 1)
@@ -1037,16 +1509,27 @@ def generate_forecast() -> dict:
             "baseline_entries": baseline,
             "low_entries": max(0, baseline - margin),
             "high_entries": baseline + margin,
-            "sample_weeks": len(counts),
-            "method": "近4周均值 × 13周；区间为历史周波动的程序估计",
+            # 周序列是"连续补零"的：中断期会被读成 0 条，对斜率与标准差影响很大，
+            # 这里如实带上"有记录的周数 / 补零周数"，并在 prompt 里点明（A5-31）。
+            "sample_weeks": active_weeks,
+            "zero_weeks": zero_weeks,
+            "method": "近4周均值 × 13周；区间为历史周波动的程序估计（周序列对中断期补零）",
         }
     weekly_str = "、".join(f"{w['week']}:{w['count']}条" for w in s["weekly_counts"])
+    interrupted_note = ""
+    if zero_weeks:
+        interrupted_note = (
+            f"\n- 注意：上面 {len(counts)} 周中有 {zero_weeks} 周完全没有记录（程序补 0），"
+            "这些 0 会压低斜率、放大波动；请把它当作「当时没记录」而不是「习惯衰退」，"
+            "不要据此下「趋势下降」的判词。")
     user_text = (
         "以下是程序统计出的记录趋势数据（单位：ISO 周）：\n"
         f"- 逐周记录数：{weekly_str}\n"
         f"- 最小二乘斜率：{s['slope']:+.3f} 条/周（正数表示上升趋势）\n"
+        f"- 有记录的周数：{active_weeks} 周（序列共 {len(counts)} 周）\n"
         f"- 最近 4 周移动平均：{s['moving_avg_4']} 条/周\n"
-        f"- 累计记录：{s['total_entries']} 条，约 {s['total_words']} 字\n"
+        f"- 累计记录：{s['total_entries']} 条，约 {s['total_words']} 字"
+        f"{interrupted_note}\n"
         "请基于这些数据输出三个 90 天情景（基准/积极/保守）的 JSON。"
         "不要输出单点确定预测；请在 narrative 中明确这是记录投入的趋势，不是对现实结果的承诺。"
     )
@@ -1157,27 +1640,36 @@ def generate_growth_summary() -> dict:
         (cutoff,),
     )
     if len(rows) < 3:
-        # 最近 60 天不足则放宽到全部记录
+        # 最近 60 天不足则放宽到"最近 300 条"（不取全量：历史越长，
+        # 附件读取与 SQL 次数越多，而最终只有一小段能进入 prompt）。
         rows = db.q(
             "SELECT * FROM entries WHERE deleted_at IS NULL AND exclude_from_ai=0 "
-            "ORDER BY occurred_at"
+            "ORDER BY occurred_at DESC LIMIT 300"
         )
+        rows = list(reversed(rows))
     if len(rows) < 3:
         raise NoDataError("记录还太少，先写几天日志再来吧")
 
     knowledge = db.q(
         "SELECT title FROM knowledge WHERE status='accepted' ORDER BY created_at DESC LIMIT 30"
     )
-    user_text = (
-        f"以下是他/她的 {len(rows)} 条日志记录（最近的记录），"
-        f"请按要求输出成长现状总结 JSON：\n\n{_entries_text(rows)}"
-    )
+    # 现状总结：超预算时保留最新记录，丢最早的（A5-03）。
+    entries_text, included = _entries_text(rows, keep_latest=True)
+    if included["omitted"]:
+        head = (f"以下是他/她的日志记录（共 {len(rows)} 条；因长度限制，本提示只包含其中"
+                f"最新的 {included['included']} 条，已省略 {included['omitted']} 条更早的记录），"
+                f"覆盖日期：{'、'.join(included['dates'])}。"
+                f"请按要求输出成长现状总结 JSON：\n\n")
+    else:
+        head = (f"以下是他/她的 {len(rows)} 条日志记录（最近的记录），"
+                f"请按要求输出成长现状总结 JSON：\n\n")
+    user_text = head + entries_text
     if knowledge:
         user_text += "\n\n已沉淀的经验知识：" + "、".join(k["title"] for k in knowledge)
     user_text += _circle_inject("成长总结")
     source_hash = hashlib.sha256(user_text.encode("utf-8")).hexdigest()
 
-    source_by_id = {r["id"]: _entry_verifiable_text(r) for r in rows}
+    source_by_id = _LazySources(rows)
     data = _chat_json([
         {"role": "system", "content": SUMMARY_SYSTEM},
         {"role": "user", "content": user_text},
@@ -1192,9 +1684,10 @@ def generate_growth_summary() -> dict:
             title = str(item.get("title") or "").strip()
             detail = str(item.get("detail") or "").strip()
             when = str(item.get("when") or "").strip()
-            ids = [str(x) for x in (item.get("evidence_entry_ids") or []) if str(x) in source_by_id][:2]
+            ids = [x for x in _id_list(item.get("evidence_entry_ids"))
+                   if x in source_by_id][:2]
             quote = str(item.get("evidence_quote") or "").strip()[:120]
-            valid_quote = bool(quote and any(quote in source_by_id[eid] for eid in ids))
+            valid_quote = bool(quote and any(quote in source_by_id.get(eid, "") for eid in ids))
             if (title or detail) and ids and valid_quote:
                 milestones.append({"when": when, "title": title, "detail": detail,
                                    "evidence_entry_ids": ids, "evidence_quote": quote})
@@ -1333,6 +1826,9 @@ def _validate_scan(data: dict, page_count: int) -> dict:
                 coords = [float(v) for v in box]
             except (TypeError, ValueError):
                 continue
+            # 坐标必须是有限值：NaN/Infinity 落库后会破坏前端 JSON 序列化（A5-11）。
+            if any(not math.isfinite(c) for c in coords):
+                continue
             try:
                 page = int(fig.get("page", 1))
             except (TypeError, ValueError):
@@ -1355,12 +1851,22 @@ def _validate_scan(data: dict, page_count: int) -> dict:
 # ---------------- 嵌入模型槽位与语义检索 ----------------
 
 def _embed_settings() -> tuple[str, str, str] | None:
-    """embed_model 必填；url/key 空时回落 strong 的 url/key。"""
+    """embed_model 必填；url/key 必须同源，只有两者都为空时才整体回落 strong。
+
+    绝不把 A 家的 Key 发给 B 家的地址：只配了 embed_base_url 却没配 embed_key
+    时视为"半配"，宁可当作未配置（A5-02）。
+    """
     model = db.get_setting("embed_model").strip()
     if not model:
         return None
-    base = db.get_setting("embed_base_url").strip() or db.get_setting("ai_base_url").strip()
-    key = db.get_setting("embed_key").strip() or db.get_setting("ai_key").strip()
+    e_url = db.get_setting("embed_base_url").strip()
+    e_key = db.get_setting("embed_key").strip()
+    if e_url and e_key:
+        base, key = e_url, e_key
+    elif not e_url and not e_key:
+        base, key = db.get_setting("ai_base_url").strip(), db.get_setting("ai_key").strip()
+    else:
+        return None  # 半配状态：不做跨供应商拼接
     if not (base and key):
         return None
     return base, key, model
@@ -1380,27 +1886,120 @@ def _embed_url(base: str) -> str:
     return b + "/embeddings" if "/v1" in b else b + "/v1/embeddings"
 
 
-def embed_text(text: str) -> list[float] | None:
-    """调用 /embeddings。30s 超时，网络错误重试 2 次；任何失败静默返回 None。"""
-    cfg = _embed_settings()
-    if not cfg or not text or not text.strip():
-        return None
-    base, key, model = cfg
+#: 嵌入调用的总耗时预算（秒）：不再"3 次 × 30s"死等。
+EMBED_BUDGET_S = 45.0
+_embed_diag_done: set = set()
+_embed_diag_lock = threading.Lock()
+
+
+def _embed_log_once(reason: str, detail: str) -> None:
+    """同一类嵌入失败只记一次日志（对外保持静默降级，但不再完全无痕）。
+
+    一旦某次调用成功，清空去重标记，让"修好之后又坏了"能再次留痕。
+    """
+    with _embed_diag_lock:
+        if reason in _embed_diag_done:
+            return
+        _embed_diag_done.add(reason)
+    logx.log(reason, detail)
+
+
+def _embed_log_reset() -> None:
+    with _embed_diag_lock:
+        _embed_diag_done.clear()
+
+
+def _embed_call(payload: dict, cfg: tuple[str, str, str], deadline: float) -> list | None:
+    """POST /embeddings；任何失败都只记一次日志并返回 None（本函数绝不抛异常）。"""
+    base, key, _model = cfg
     url = _embed_url(base)
-    payload = {"model": model, "input": text[:8000]}
-    for attempt in range(3):  # 1 次正式 + 网络错误重试 2 次
-        try:
-            with httpx.Client(timeout=30.0) as c:
-                r = c.post(url, json=payload, headers={"Authorization": f"Bearer {key}"})
-            if r.status_code != 200:
-                return None
-            vec = r.json()["data"][0]["embedding"]
-            return [float(x) for x in vec]
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError):
-            continue
-        except Exception:
+    try:
+        timeout = max(1.0, min(30.0, deadline - time.monotonic()))
+    except Exception:
+        timeout = 30.0
+    try:
+        with _AI_SEMAPHORE:
+            r = _client_get().post(url, json=payload,
+                                   headers={"Authorization": f"Bearer {key}"},
+                                   timeout=_split_timeout(timeout))
+    except httpx.HTTPError as e:
+        _embed_log_once("嵌入调用失败", f"网络错误：{type(e).__name__}")
+        return None
+    except Exception as e:
+        # 地址非法等非网络异常同样静默降级（对外契约是"失败返回 None"）。
+        _embed_log_once("嵌入调用失败", f"请求异常：{type(e).__name__}")
+        return None
+    if r.status_code != 200:
+        _embed_log_once("嵌入索引失败", f"HTTP {r.status_code} {_redact(r.text[:120])}")
+        return None
+    try:
+        data = (r.json() or {}).get("data") or []
+    except ValueError:
+        _embed_log_once("嵌入索引失败", "响应不是合法 JSON")
+        return None
+    if not isinstance(data, list) or not data:
+        _embed_log_once("嵌入索引失败", "响应缺少 data 数组")
+        return None
+    _embed_log_reset()   # 本次成功：清空去重标记，后续再坏能重新留痕
+    return data
+
+
+def _vec_of(item) -> list[float] | None:
+    try:
+        vec = item["embedding"]
+        out = [float(x) for x in vec]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if not out or any(not math.isfinite(v) for v in out):
+        return None
+    return out
+
+
+def embed_texts(texts: list[str], budget_s: float = EMBED_BUDGET_S) -> list[list[float] | None]:
+    """批量取嵌入（OpenAI 兼容接口支持 input 为数组）：一次请求拿回全部向量。
+
+    返回与 texts 等长的列表，失败位置为 None；未配置返回 []。全部失败只共用
+    一个总耗时预算（budget_s），不会退化成"每条各等一个预算"。
+    """
+    cfg = _embed_settings()
+    if not cfg or not texts:
+        return []
+    # 保留原文（用于计算返回顺序），只在送给上游时截断，避免下标错位。
+    clean = [t if (t or "").strip() else " " for t in texts]
+    payload = {"model": cfg[2], "input": [t[:8000] for t in clean]}
+    deadline = time.monotonic() + budget_s
+    data = _embed_call(payload, cfg, deadline)
+    if data is None:
+        # 批量失败：退化为逐条（部分网关不支持数组 input），仍共享同一个总预算。
+        return [embed_text(t, deadline=deadline) for t in texts]
+    out: list[list[float] | None] = []
+    for item in sorted(data, key=lambda d: (d.get("index") if isinstance(d, dict) else 0) or 0):
+        out.append(_vec_of(item) if isinstance(item, dict) else None)
+    if len(out) != len(texts) or all(v is None for v in out):
+        return [embed_text(t, deadline=deadline) for t in texts]
+    return out
+
+
+def embed_text(text: str, deadline: float | None = None) -> list[float] | None:
+    """调用 /embeddings。总预算 45s（connect 10s），失败记一次日志并返回 None。
+
+    本函数对外契约是"永不抛异常"（scheduler/links/circle 都以 None 作为降级信号）。
+    """
+    try:
+        cfg = _embed_settings()
+        if not cfg or not text or not text.strip():
             return None
-    return None
+        if deadline is None:
+            deadline = time.monotonic() + EMBED_BUDGET_S
+        if deadline - time.monotonic() <= 0:
+            return None  # 总预算已耗尽，不再发起请求
+        data = _embed_call({"model": cfg[2], "input": text[:8000]}, cfg, deadline)
+        if not data:
+            return None
+        return _vec_of(data[0])
+    except Exception as e:
+        _embed_log_once("嵌入调用失败", f"未预期异常：{type(e).__name__}")
+        return None
 
 
 def _entry_embed_text(row) -> str:
@@ -1470,7 +2069,13 @@ def cosine(a: list, b: list) -> float:
         nb += y * y
     if na == 0 or nb == 0:
         return 0.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
+    score = dot / (math.sqrt(na) * math.sqrt(nb))
+    # 向量含 NaN/Infinity 时返回 0，避免 NaN 污染排序与阈值比较（A5-11）。
+    return score if math.isfinite(score) else 0.0
+
+
+#: 语义检索一次最多扫描的向量条数（按最近更新优先），避免每次提问全表反序列化。
+SEMANTIC_SCAN_LIMIT = 2000
 
 
 def semantic_topk(query_vec: list, k: int = 8, exclude_id: str | None = None) -> list[tuple[str, float]]:
@@ -1478,17 +2083,23 @@ def semantic_topk(query_vec: list, k: int = 8, exclude_id: str | None = None) ->
     rows = db.q(
         "SELECT e.entry_id, e.vector_json FROM entry_embeddings e "
         "JOIN entries en ON e.entry_id = en.id "
-        "WHERE en.deleted_at IS NULL AND en.exclude_from_ai = 0"
+        "WHERE en.deleted_at IS NULL AND en.exclude_from_ai = 0 "
+        "ORDER BY e.updated_at DESC LIMIT ?",
+        (SEMANTIC_SCAN_LIMIT,),
     )
+    if len(rows) >= SEMANTIC_SCAN_LIMIT:
+        logx.log("语义检索", f"向量超过 {SEMANTIC_SCAN_LIMIT} 条，本次只扫描最近更新的部分")
     scored = []
     for r in rows:
         if exclude_id and r["entry_id"] == exclude_id:
             continue
         try:
-            vec = json.loads(r["vector_json"])
+            vec = json.loads(r["vector_json"], parse_constant=_reject_constant)
         except ValueError:
             continue
-        scored.append((r["entry_id"], cosine(query_vec, vec)))
+        score = cosine(query_vec, vec)
+        if math.isfinite(score):
+            scored.append((r["entry_id"], score))
     scored.sort(key=lambda t: t[1], reverse=True)
     return scored[:k]
 
@@ -1683,8 +2294,7 @@ YEAR_CARDS_SYSTEM = """你在为用户做年度回顾故事卡（Wrapped 风）�
 
 def generate_year_cards(stats: dict, quote_candidates: list) -> dict:
     """strong 生成年度故事卡。返回 {"cards": [...], "quote": {...}|None}；失败抛 AIError。"""
-    import json as _json
-    stats_text = _json.dumps(stats, ensure_ascii=False, indent=1)
+    stats_text = json.dumps(stats, ensure_ascii=False, indent=1, allow_nan=False)
     quotes_text = "\n".join(
         f"- [{q['date']}] {q['text']}" for q in quote_candidates[:30]
     ) or "（无候选）"
@@ -1709,10 +2319,16 @@ def generate_year_cards(stats: dict, quote_candidates: list) -> dict:
     q = data.get("quote")
     if isinstance(q, dict):
         qtext = str(q.get("text") or "").strip()[:120]
-        qdate = str(q.get("date") or "").strip()[:10]
-        # 防伪：金句必须逐字出现在候选里
-        if qtext and any(qtext in c["text"] or c["text"] in qtext for c in quote_candidates):
-            quote = {"text": qtext, "date": qdate}
+        # 防伪：金句必须是候选原话的子串（只保留 qtext in candidate 方向，
+        # 并要求至少 10 字），日期一律用候选自带的真实日期覆盖模型给的（A5-14/A5-29）。
+        match = None
+        if len(qtext) >= 10:
+            match = next((c for c in quote_candidates
+                          if qtext in str(c.get("text") or "")), None)
+        if match is not None:
+            quote = {"text": qtext, "date": str(match.get("date") or "").strip()[:10]}
+        elif qtext:
+            logx.log("年度金句未采纳", "AI 给的原话不在候选原文中或过短")
     return {"cards": cards[:8], "quote": quote}
 
 
@@ -1750,11 +2366,18 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def _knowledge_dedupe_match(ktype: str, title: str, content: str):
+def _knowledge_dedupe_match(ktype: str, title: str, content: str,
+                            vec: list[float] | None = None,
+                            vec_ready: bool = False):
     """语义级判重。返回 (匹配的已有行 or None, 本条向量 or None)。
 
-    依次：a) dedupe_key 精确命中；b) embed 余弦 ≥0.85；c) 无嵌入时
-    bigram Jaccard ≥0.6（仅 type 相同或一方为 skill）。只防新增，不动存量。
+    依次：a) dedupe_key 精确命中；b) embed 余弦 ≥KNOWLEDGE_DEDUPE_COS（0.82）；
+    c) 无嵌入时 bigram Jaccard ≥0.6（仅 type 相同或一方为 skill）。只防新增，不动存量。
+    阈值提为模块常量，避免注释与实现再次漂移。
+
+    vec/vec_ready 允许调用方**预先批量**算好本条向量（A5-17）：一次报告里的
+    多条知识共用一次 /embeddings 请求，不再逐条串行等待。
+    vec_ready=True 表示"已经决定过向量了（哪怕是 None）"，此时不再发起嵌入调用。
     """
     key = db.knowledge_dedupe_key(title)
     if key:
@@ -1766,29 +2389,38 @@ def _knowledge_dedupe_match(ktype: str, title: str, content: str):
         if row is not None:
             return row, None
 
-    vec = None
-    if embed_configured():
-        vec = embed_text(title + "\n" + content[:200])
+    if not vec_ready:
+        if embed_configured():
+            vec = embed_text(title + "\n" + content[:200])
+        else:
+            vec = None
     if vec is not None:
-        rows = db.q(
-            "SELECT * FROM knowledge WHERE status IN ('pending','accepted','rejected') "
-            "AND vector_json IS NOT NULL AND vector_json != ''"
-        )
+        # 嵌入调用失败（限流/超时）时直接退到 bigram 兜底，不在超时上死等（A5-17）。
+        try:
+            rows = db.q(
+                "SELECT * FROM knowledge WHERE status IN ('pending','accepted','rejected') "
+                "AND vector_json IS NOT NULL AND vector_json != ''"
+            )
+        except Exception:
+            rows = []
         for r in rows:
             try:
-                other = json.loads(r["vector_json"])
+                other = json.loads(r["vector_json"], parse_constant=_reject_constant)
             except ValueError:
                 continue
-            if cosine(vec, other) >= 0.82:
+            if cosine(vec, other) >= KNOWLEDGE_DEDUPE_COS:
                 return r, vec
         return None, vec
 
     # 无嵌入兜底：bigram Jaccard
     cand = _bigrams(title + content)
     if cand:
-        rows = db.q(
-            "SELECT * FROM knowledge WHERE status IN ('pending','accepted','rejected')"
-        )
+        try:
+            rows = db.q(
+                "SELECT * FROM knowledge WHERE status IN ('pending','accepted','rejected')"
+            )
+        except Exception:
+            rows = []
         for r in rows:
             if not (r["type"] == ktype or ktype == "skill" or r["type"] == "skill"):
                 continue
@@ -1919,7 +2551,7 @@ def generate_directions() -> list:
         rationale = str(item.get("rationale") or "").strip()[:60]
         experiment = str(item.get("experiment") or "").strip()[:100]
         success_signal = str(item.get("success_signal") or "").strip()[:100]
-        ids = [str(x) for x in (item.get("evidence_entry_ids") or []) if str(x) in source_by_id][:2]
+        ids = [x for x in _id_list(item.get("evidence_entry_ids")) if x in source_by_id][:2]
         quote = str(item.get("evidence_quote") or "").strip()[:120]
         if (title and rationale and experiment and success_signal and ids and quote
                 and any(quote in source_by_id[eid] for eid in ids)):
@@ -2121,8 +2753,7 @@ CIRCLE_EXTRACT_SYSTEM = """从用户日志中提取明确出现的人物、地�
 
 def _person_roster(limit: int = 40) -> str:
     """启用中（active/confirmed）的全类型档案花名册：人物/地点/事件，名字+别名+关系，供消歧。"""
-    from . import db as _db
-    rows = _db.q(
+    rows = db.q(
         "SELECT name, type, aliases_json, relation_to_user FROM entities "
         "WHERE status IN ('active','confirmed') "
         "ORDER BY CASE status WHEN 'confirmed' THEN 0 ELSE 1 END, last_seen DESC LIMIT ?",
@@ -2141,7 +2772,6 @@ def _person_roster(limit: int = 40) -> str:
         if r["relation_to_user"]:
             parts += f"｜{r['relation_to_user']}"
         lines.append("- " + parts)
-    return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -2251,13 +2881,10 @@ def judge_same_entity(a: dict, b: dict) -> dict:
     ], slot="fast")
     if not isinstance(data, dict):
         raise AIError("AI 返回的内容结构不正确，请重试")
-    try:
-        confidence = float(data.get("confidence"))
-    except (TypeError, ValueError):
-        confidence = 0.0
     return {
         "same": bool(data.get("same")),
-        "confidence": min(max(confidence, 0.0), 1.0),
+        # NaN 会让 min/max 钳制失效，必须先用 _clamp01 收敛为有限值（A5-11）。
+        "confidence": _clamp01(data.get("confidence"), 0.0),
         "reason": str(data.get("reason") or "").strip()[:40],
     }
 
@@ -2364,11 +2991,7 @@ def synthesize_entity_profile(row, mention_rows) -> dict:
     if not isinstance(data, dict):
         raise AIError("AI 返回的内容结构不正确，请重试")
 
-    try:
-        confidence = float(data.get("confidence"))
-    except (TypeError, ValueError):
-        confidence = 0.4
-    confidence = min(max(confidence, 0.0), 1.0)
+    confidence = _clamp01(data.get("confidence"), 0.4)
 
     relations = []
     for item in data.get("relations") or []:
@@ -2437,18 +3060,26 @@ def synthesize_entity_profile(row, mention_rows) -> dict:
 
 def _circle_inject(label: str, entry_ids: list | None = None) -> str:
     """生成'背景档案'段落并记一行日志；无档案返回空串。lazy import 避免循环依赖。
-    传了 entry_ids（本期报告/命中记录）就按范围精确挑选相关档案，否则取最近活跃的。"""
+    传了 entry_ids（本期报告/命中记录）就按范围精确挑选相关档案，否则取最近活跃的。
+    取档案失败时写一行日志说明本次降级，不再静默吞掉（A5-20）。"""
     try:
-        from . import circle as circle_mod, logx
+        from . import circle as circle_mod
+    except ImportError as e:
+        logx.log(label, f"档案模块不可用，本次未参考背景档案（{type(e).__name__}）")
+        return ""
+    try:
         if entry_ids:
             text, names = circle_mod.circle_context_for_entries(entry_ids)
             if not text:  # 范围内没有相关档案时，退回最近活跃
                 text, names = circle_mod.circle_context_with_names()
         else:
             text, names = circle_mod.circle_context_with_names()
-        if not text:
-            return ""
-        logx.log(label, "参考档案：" + "".join(f"《{n}》" for n in names))
-        return "\n\n背景档案（由以往记录整理，供理解人物关系）：\n" + text
-    except Exception:
+    except Exception as e:
+        # 只把"取档案失败"记一条日志；确实没有档案仍走下面的空串分支（无需噪声）。
+        logx.log(label, f"档案注入失败，本次未参考背景档案（{type(e).__name__}）")
         return ""
+    if not text:
+        return ""
+    # 档案名是真实姓名，日志里只记份数，避免用户内容进 app.log（A5-30 同源问题）。
+    logx.log(label, f"参考档案 {len(names)} 份")
+    return "\n\n背景档案（由以往记录整理，供理解人物关系）：\n" + text

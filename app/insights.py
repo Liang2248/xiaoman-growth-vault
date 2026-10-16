@@ -2,9 +2,11 @@
 """小满发现的规律（相关性发现引擎，G1）。
 
 近 180 天记录按天聚合，对每个特征算「有该特征的天 vs 没有的天」的心情均值差与
-点二列相关 r；同日与滞后 1 日（今天有→明天心情）各算一遍。
+点二列相关 r；同日与滞后 1 日（今天有→明天心情）各算一遍，同一 feature 只保留
+|r| 更大的那个 lag（避免同一主题占满 Top6）。
 门槛从严：特征出现 ≥8 天且对照 ≥8 天、|r|≥0.25 才出；取 |r| Top6。
 dismiss 过的 feature 永不再出；无心情数据/样本不足 → 安静不出（不报错、不通知）。
+所有统计口径与主路径一致：exclude_from_ai=0 的记录既不参与统计，也不会被送给 AI。
 """
 from __future__ import annotations
 
@@ -21,10 +23,10 @@ TOP_N = 6
 
 
 def _daily_mood() -> dict[str, float]:
-    """每天的心情均分（只取有 mood_score 的天）。"""
+    """每天的心情均分（只取有 mood_score 的天，且排除用户标记"不给 AI 看"的记录）。"""
     rows = db.q(
         "SELECT substr(occurred_at,1,10) AS d, AVG(mood_score) AS m FROM entries "
-        "WHERE deleted_at IS NULL AND mood_score IS NOT NULL "
+        "WHERE deleted_at IS NULL AND exclude_from_ai=0 AND mood_score IS NOT NULL "
         "AND substr(occurred_at,1,10) >= ? GROUP BY d",
         ((date.today() - timedelta(days=DAYS)).isoformat(),),
     )
@@ -54,12 +56,13 @@ def _feature_days(start: date) -> dict[str, set[str]]:
     feats: dict[str, set[str]] = {}
     since = start.isoformat()
 
-    # 类目（entry_categories JOIN categories，仅 active）
+    # 类目（entry_categories JOIN categories，仅 active；排除 exclude_from_ai 记录）
     for r in db.q(
         "SELECT DISTINCT substr(e.occurred_at,1,10) AS d, c.slug, c.name_zh "
         "FROM entries e JOIN entry_categories ec ON ec.entry_id=e.id "
         "JOIN categories c ON c.id=ec.category_id "
-        "WHERE e.deleted_at IS NULL AND c.status='active' AND substr(e.occurred_at,1,10) >= ?",
+        "WHERE e.deleted_at IS NULL AND e.exclude_from_ai=0 AND c.status='active' "
+        "AND substr(e.occurred_at,1,10) >= ?",
         (since,),
     ):
         feats.setdefault(f"cat:{r['slug']}", set()).add(r["d"])
@@ -69,7 +72,8 @@ def _feature_days(start: date) -> dict[str, set[str]]:
         "SELECT en.id, en.name, COUNT(DISTINCT substr(e.occurred_at,1,10)) AS nd "
         "FROM entity_mentions m JOIN entries e ON e.id=m.entry_id "
         "JOIN entities en ON en.id=m.entity_id "
-        "WHERE e.deleted_at IS NULL AND en.type='person' AND en.status IN ('confirmed','active') "
+        "WHERE e.deleted_at IS NULL AND e.exclude_from_ai=0 "
+        "AND en.type='person' AND en.status IN ('confirmed','active') "
         "AND substr(e.occurred_at,1,10) >= ? GROUP BY en.id HAVING nd >= 3 "
         "ORDER BY nd DESC LIMIT 8",
         (since,),
@@ -78,7 +82,7 @@ def _feature_days(start: date) -> dict[str, set[str]]:
         days = db.q(
             "SELECT DISTINCT substr(e.occurred_at,1,10) AS d FROM entity_mentions m "
             "JOIN entries e ON e.id=m.entry_id WHERE m.entity_id=? AND e.deleted_at IS NULL "
-            "AND substr(e.occurred_at,1,10) >= ?",
+            "AND e.exclude_from_ai=0 AND substr(e.occurred_at,1,10) >= ?",
             (p["id"], since),
         )
         feats[f"person:{p['id']}"] = {r["d"] for r in days}
@@ -88,7 +92,7 @@ def _feature_days(start: date) -> dict[str, set[str]]:
         "SELECT substr(occurred_at,1,10) AS d, weather_json, "
         "substr(occurred_at,12,2) AS h, "
         "(length(content)+length(summary)+length(title)) AS w FROM entries "
-        "WHERE deleted_at IS NULL AND substr(occurred_at,1,10) >= ?",
+        "WHERE deleted_at IS NULL AND exclude_from_ai=0 AND substr(occurred_at,1,10) >= ?",
         (since,),
     )
     words_by_day: dict[str, int] = {}
@@ -135,7 +139,8 @@ def _dismissed_features() -> set[str]:
 
 
 def _render_text(label: str, ev: dict) -> str:
-    """小模型润色成一句温暖人话；AI 不可用/失败时用克制模板。都要自然带出「相关不等于因果」。"""
+    """小模型润色成一句温暖人话；AI 不可用/失败时用克制模板。都要自然带出「相关不等于因果」。
+    调用方必须保证本函数不在 db.locked() 临界区内调用（内部是网络 I/O）。"""
     diff = ev["avg_with"] - ev["avg_without"]
     direction = "高" if diff >= 0 else "低"
     plain = (f"{label}，你的心情平均 {ev['avg_with']:.1f} 分，比没有的日子{direction} "
@@ -193,15 +198,26 @@ def compute_weekly() -> int:
                              "lag": lag},
             })
     candidates.sort(key=lambda c: abs(c["r"]), reverse=True)
-    top = candidates[:TOP_N]
+    # 同一 feature 的 lag0/lag1 是同一主题的两种表述：只保留 |r| 更大的那个，
+    # 否则 Top6 会被 3 个 feature 占满，把其它独立特征全挤出去（A5-22）。
+    best: dict[str, dict] = {}
+    for cand in candidates:
+        cur = best.get(cand["feature"])
+        if cur is None or abs(cand["r"]) > abs(cur["r"]):
+            best[cand["feature"]] = cand
+    top = sorted(best.values(), key=lambda c: abs(c["r"]), reverse=True)[:TOP_N]
 
     # 本周重算：替换仍 active 的（dismissed 已在上游被排除，永不复活）
     now = db.now_iso()
+    # AI 润色是网络调用，必须在 db.locked() 之外完成：先算好标签与文案，
+    # 再进临界区只做 DELETE + INSERT，避免持锁期间冻结全站数据库（A5-01）。
+    rendered = []
+    for cand in top:
+        label = _feature_label(cand["feature"])
+        rendered.append((cand, _render_text(label, cand["evidence"])))
     with db.locked() as c:
         c.execute("DELETE FROM insights WHERE status='active'")
-        for cand in top:
-            label = _feature_label(cand["feature"])
-            text = _render_text(label, cand["evidence"])
+        for cand, text in rendered:
             c.execute(
                 "INSERT INTO insights(id, kind, feature, text, evidence_json, score, status, created_at) "
                 "VALUES(?,?,?,?,?,?, 'active', ?)",

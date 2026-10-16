@@ -2,8 +2,11 @@
 """年度故事卡数据（G6）。
 
 GET /api/year-review?year= → 缓存超 7 天或没有则重算。
-聚合全年真实统计；AI（strong）生成 6-8 张 Wrapped 风故事卡 + 一张金句卡（用户原话+日期）。
+聚合全年真实统计（口径与主路径一致：排除 exclude_from_ai 记录，用户排除的内容
+既不出现在卡片数字里，也不会随 stats 被送进 AI）；AI（strong）生成 6-8 张
+Wrapped 风故事卡 + 一张金句卡（用户原话+日期）。
 AI 未配置 → 纯数据卡兜底（数字卡不依赖 AI），金句卡跳过。
+降级结果只缓存 10 分钟，短暂故障不会把该年份锁成"纯数据卡"一周。
 进行中的年份一律用「至今」口径。
 """
 from __future__ import annotations
@@ -14,6 +17,8 @@ from datetime import date, datetime, timedelta
 from . import ai as ai_mod, db, logx
 
 CACHE_DAYS = 7
+#: AI 失败（降级为纯数据卡）时的短缓存，让用户重试就能拿到 AI 卡片。
+DEGRADED_CACHE_MINUTES = 10
 
 
 def _year_stats(year: int) -> dict:
@@ -21,7 +26,8 @@ def _year_stats(year: int) -> dict:
     rows = db.q(
         "SELECT substr(occurred_at,1,10) AS d, "
         "(length(content)+length(summary)+length(title)) AS w FROM entries "
-        "WHERE deleted_at IS NULL AND substr(occurred_at,1,10) BETWEEN ? AND ?",
+        "WHERE deleted_at IS NULL AND exclude_from_ai=0 "
+        "AND substr(occurred_at,1,10) BETWEEN ? AND ?",
         (y0, y1),
     )
     day_words: dict[str, int] = {}
@@ -51,7 +57,7 @@ def _year_stats(year: int) -> dict:
         "SELECT c.name_zh AS name, COUNT(DISTINCT ec.entry_id) AS n "
         "FROM entry_categories ec JOIN categories c ON c.id=ec.category_id "
         "JOIN entries e ON e.id=ec.entry_id "
-        "WHERE e.deleted_at IS NULL AND c.status='active' "
+        "WHERE e.deleted_at IS NULL AND e.exclude_from_ai=0 AND c.status='active' "
         "AND substr(e.occurred_at,1,10) BETWEEN ? AND ? "
         "GROUP BY c.id ORDER BY n DESC LIMIT 6",
         (y0, y1),
@@ -61,7 +67,8 @@ def _year_stats(year: int) -> dict:
         rows2 = db.q(
             "SELECT en.name, COUNT(*) AS n FROM entity_mentions m "
             "JOIN entries e ON e.id=m.entry_id JOIN entities en ON en.id=m.entity_id "
-            "WHERE e.deleted_at IS NULL AND en.type=? AND en.status != 'rejected' "
+            "WHERE e.deleted_at IS NULL AND e.exclude_from_ai=0 "
+            "AND en.type=? AND en.status != 'rejected' "
             "AND substr(e.occurred_at,1,10) BETWEEN ? AND ? "
             "GROUP BY en.id ORDER BY n DESC LIMIT ?",
             (mtype, y0, y1, k),
@@ -130,18 +137,38 @@ def _data_cards(stats: dict, year: int) -> list[dict]:
     return cards
 
 
+def _cache_is_fresh(row) -> tuple[bool, dict | None]:
+    """判断缓存是否仍可用。AI 成功的条目缓存 7 天；降级条目（ai=False）只缓存 10 分钟，
+    避免一次网络抖动把该年份锁成"纯数据卡"一整周（A5-15）。"""
+    try:
+        gen = datetime.fromisoformat(row["generated_at"])
+        payload = json.loads(row["payload_json"])
+        # 时区无关性放在 try 内：旧的/手工写入的 generated_at 可能没有 tzinfo，
+        # 相减会抛 TypeError，此时按"缓存不可用"处理而不是让接口 500。
+        age = datetime.now().astimezone() - gen
+    except (ValueError, TypeError):
+        return False, None
+    if not isinstance(payload, dict):
+        return False, None
+    if payload.get("ai"):
+        return age.days < CACHE_DAYS, payload
+    # 降级条目：短 TTL 之后允许重算（用户重试即可拿到 AI 卡片）。
+    return age < timedelta(minutes=DEGRADED_CACHE_MINUTES), payload
+
+
 def get_year_review(year: int) -> dict:
-    """缓存超 7 天或没有则重算。返回 {year, cards, quote, generated_at, ai: bool}。"""
+    """缓存超期或没有则重算。返回 {year, cards, quote, generated_at, ai: bool}。
+
+    缓存分层：ai=True 的结果缓存 7 天；降级结果（ai=False）只缓存 10 分钟，
+    让用户重试就能拿到 AI 卡片。
+    """
     row = db.q1("SELECT * FROM year_reviews WHERE year=?", (year,))
     if row is not None:
-        try:
-            gen = datetime.fromisoformat(row["generated_at"])
-            if (datetime.now().astimezone() - gen).days < CACHE_DAYS:
-                payload = json.loads(row["payload_json"])
-                return {"year": year, "generated_at": row["generated_at"], **payload}
-        except (ValueError, TypeError):
-            pass
+        fresh, payload = _cache_is_fresh(row)
+        if fresh and payload is not None:
+            return {"year": year, "generated_at": row["generated_at"], **payload}
 
+    # 降级失败时仍以本次纯数据卡作答（与旧行为一致），但 payload 只带 10 分钟 TTL。
     stats = _year_stats(year)
     ai_used = False
     quote = None
@@ -153,7 +180,12 @@ def get_year_review(year: int) -> dict:
             quote = result.get("quote")
             ai_used = True
         except Exception as e:
-            logx.log("年度故事卡 AI 生成失败", f"改用纯数据卡：{str(e)[:60]}")
+            # 只把 AI 侧失败降级为纯数据卡；其它异常（如 stats 结构变化）沿用同样
+            # 的兜底但文案区分开，便于排障（降级缓存只存 10 分钟）。
+            if isinstance(e, ai_mod.AIError):
+                logx.log("年度故事卡 AI 生成失败", f"改用纯数据卡：{str(e)[:60]}")
+            else:
+                logx.log("年度故事卡生成异常", f"改用纯数据卡：{type(e).__name__} {str(e)[:60]}")
     if not cards:
         cards = _data_cards(stats, year)
     payload = {"cards": cards, "quote": quote, "ai": ai_used, "stats": stats}
@@ -165,5 +197,5 @@ def get_year_review(year: int) -> dict:
         (year, json.dumps(payload, ensure_ascii=False), now),
     )
     logx.log("年度故事卡已生成", f"{year} 年，{len(cards)} 张卡"
-                              + ("（含 AI 金句卡）" if ai_used else "（纯数据卡）"))
+                              + ("（含 AI 金句卡）" if ai_used else "（纯数据卡，10 分钟后可重试）"))
     return {"year": year, "generated_at": now, **payload}

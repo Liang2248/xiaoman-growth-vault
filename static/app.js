@@ -91,12 +91,25 @@
   var CATS = { work: '工作', life: '生活', mixed: '混合' };
 
   /* ---------------- Toast ---------------- */
+  // A7-27：限制同时显示条数 / 相同文案去重 / 超长截断。
+  // 离线队列每轮重试都会弹同一条错误，不做限制会在移动端盖住底部保存按钮。
+  var TOAST_MAX_VISIBLE = 3;
+  var TOAST_DEDUP_MS = 2000;
+  var TOAST_MAX_LEN = 120;
+  var toastRecent = {};
   function toast(msg, type, ms) {
     var root = $('#toasts');
     if (!root) return;
+    var text = String(msg == null ? '' : msg);
+    if (text.length > TOAST_MAX_LEN) text = text.slice(0, TOAST_MAX_LEN) + '…';
+    var now = Date.now();
+    if (toastRecent[text] && now - toastRecent[text] < TOAST_DEDUP_MS) return;
+    toastRecent[text] = now;
+    var live = $$('.toast', root);
+    for (var i = 0; i <= live.length - TOAST_MAX_VISIBLE; i++) live[i].remove();
     var t = document.createElement('div');
     t.className = 'toast toast-' + (type || 'info');
-    t.textContent = msg;
+    t.textContent = text;
     root.appendChild(t);
     requestAnimationFrame(function () { t.classList.add('show'); });
     setTimeout(function () {
@@ -107,6 +120,17 @@
 
   /* ---------------- API 封装 ----------------
    * 统一 JSON；非 2xx 抛出带后端 detail 的 Error；支持超时。 */
+  // A7-13：裸 fetch / XHR 调用点共用同一套「锁屏 + 中文兜底」处理
+  var LOCKED_MSG = '小满上了锁，请输入访问口令';
+  function handleAuthStatus(status, detail) {
+    if (status === 401 && detail === 'locked') { showLockScreen(); return true; }
+    return false;
+  }
+  function friendlyError(msg, status) {
+    if (status === 401 && msg === 'locked') return LOCKED_MSG;
+    return msg;
+  }
+
   async function api(path, opts) {
     opts = opts || {};
     var ctrl = new AbortController();
@@ -121,9 +145,13 @@
       res = await fetch(path, init);
     } catch (e) {
       clearTimeout(timer);
-      var netErr = new Error(ctrl.signal.aborted ? '请求超时了，请稍后再试' : '连不上服务，请确认电脑上的后端已启动');
-      // 网络层异常（服务不可达 / 离线）打标记，调用方可据此走离线逻辑
-      if (!ctrl.signal.aborted) netErr.isNetwork = true;
+      var timedOut = !!ctrl.signal.aborted;
+      var netErr = new Error(timedOut ? '请求超时了，请稍后再试' : '连不上服务，请确认电脑上的后端已启动');
+      // A7-02：手机走出 Wi-Fi 覆盖时连接常被黑洞挂起，表现为本地超时中断。
+      // 超时必须同样按「网络不可达」处理，否则最典型的移动场景会走错分支（不入离线队列）。
+      netErr.isNetwork = true;
+      if (timedOut) netErr.isTimeout = true;
+      try { if (navigator.onLine === false) netErr.isOffline = true; } catch (e2) { /* 忽略 */ }
       throw netErr;
     }
     clearTimeout(timer);
@@ -138,8 +166,8 @@
         else msg = String(data.detail);
       }
       // 访问口令锁定：全站锁屏（未设锁时永不触发）
-      if (res.status === 401 && msg === 'locked') showLockScreen();
-      var err = new Error(msg);
+      handleAuthStatus(res.status, msg);
+      var err = new Error(friendlyError(msg, res.status));
       err.status = res.status;
       throw err;
     }
@@ -205,7 +233,9 @@
         var j = await res.json();
         if (j && typeof j.detail === 'string') msg = j.detail;
       } catch (e) { /* 忽略 */ }
-      throw new Error(msg);
+      // A7-13：与 api() 一致——401 locked 时弹锁屏，并给出中文提示
+      handleAuthStatus(res.status, msg);
+      throw new Error(friendlyError(msg, res.status));
     }
     var blob = await res.blob();
     var fname = opts.filename || 'download';
@@ -222,29 +252,68 @@
     setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
   }
 
+  // 后端单文件上限（mediafiles.py: MAX_UPLOAD_BYTES=500MB）：前端提前拦下，避免白传几分钟再 413
+  var MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
+
   // 附件上传（XHR 以获得上传进度）
+  // A7-03：补 timeout / ontimeout / onabort —— 只挂 onload/onerror 时，
+  // 移动端切后台被系统冻结或传输被中断会让 Promise 永不 settle，
+  // 调用方（quickSave / flushOutbox）的 finally 永不执行 → 按钮永久禁用、flushing 永久锁死。
   function uploadFiles(entryId, files, onProgress) {
     return new Promise(function (resolve, reject) {
       var fd = new FormData();
-      files.forEach(function (f) { fd.append('files', f); });
+      var total = 0;
+      files.forEach(function (f) { fd.append('files', f); total += (f && f.size) || 0; });
       var xhr = new XMLHttpRequest();
+      var settled = false;
+      var finish = function (fn, v) { if (settled) return; settled = true; fn(v); };
       xhr.open('POST', '/api/entries/' + encodeURIComponent(entryId) + '/attachments');
+      // 按体积动态给预算：至少 60 秒，按 50KB/s 估算上限（弱网下仍能传完中等文件）
+      xhr.timeout = Math.max(120000, Math.min(600000, Math.round(total / 51200) * 1000));
       xhr.upload.onprogress = function (e) {
         if (e.lengthComputable && onProgress) onProgress(Math.round(e.loaded / e.total * 100));
       };
       xhr.onload = function () {
         var j = null;
         try { j = JSON.parse(xhr.responseText); } catch (e) { /* 忽略 */ }
-        if (xhr.status >= 200 && xhr.status < 300) resolve(j);
-        else reject(new Error(j && typeof j.detail === 'string' ? j.detail : '上传失败，请重试'));
+        if (xhr.status >= 200 && xhr.status < 300) { finish(resolve, j); return; }
+        var detail = j && typeof j.detail === 'string' ? j.detail : '上传失败，请重试';
+        handleAuthStatus(xhr.status, detail);
+        finish(reject, new Error(friendlyError(detail, xhr.status)));
       };
       xhr.onerror = function () {
         var netErr = new Error('网络错误，上传失败');
         netErr.isNetwork = true;
-        reject(netErr);
+        finish(reject, netErr);
+      };
+      xhr.ontimeout = function () {
+        var netErr = new Error('上传超时了，请检查网络后重试');
+        netErr.isNetwork = true;
+        netErr.isTimeout = true;
+        finish(reject, netErr);
+      };
+      xhr.onabort = function () {
+        var netErr = new Error('上传被中断了，请重试');
+        netErr.isNetwork = true;
+        finish(reject, netErr);
       };
       xhr.send(fd);
     });
+  }
+
+  // A7-17：选中文件的前端预检（超限 / 累积体积），返回可上传的数组并 toast 说明
+  function screenFiles(files) {
+    var ok = [], tooBig = 0;
+    (files || []).forEach(function (f) {
+      if (f && f.size > MAX_UPLOAD_BYTES) { tooBig++; return; }
+      ok.push(f);
+    });
+    if (tooBig) {
+      toast('有 ' + tooBig + ' 个文件超过 500MB，已跳过；请压缩后再试', 'error', 5000);
+    } else if (!ok.length && (files || []).length) {
+      toast('没有可用于上传的文件', 'error');
+    }
+    return ok;
   }
 
   /* ---------------- 手机离线记录 outbox（IndexedDB） ----------------
@@ -259,16 +328,35 @@
       if (!window.indexedDB) return Promise.reject(new Error('no-idb'));
       if (!dbPromise) {
         dbPromise = new Promise(function (resolve, reject) {
+          var settled = false;
+          var finish = function (fn, v) { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
           var req = indexedDB.open(DB_NAME, 1);
+          // A7-08：另一个标签页持有旧版本连接且未关闭时 open 会进入 blocked 并无限等待，
+          // 导致 dbPromise 永久 pending、flushing 永久锁死（离线同步整条链路瘫痪）。
+          // 这里显式处理 blocked 并加超时兜底，失败后由下方清空缓存以便下次重试。
+          var timer = setTimeout(function () {
+            finish(reject, new Error('idb-timeout'));
+          }, 8000);
           req.onupgradeneeded = function () {
             var db = req.result;
             if (!db.objectStoreNames.contains(STORE)) {
               db.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
             }
           };
-          req.onsuccess = function () { resolve(req.result); };
-          req.onerror = function () { reject(req.error); };
+          req.onsuccess = function () {
+            var db = req.result;
+            // 其它标签页要升级版本时主动让路，避免自己变成那个「阻塞者」
+            db.onversionchange = function () {
+              try { db.close(); } catch (e) { /* 忽略 */ }
+              dbPromise = null;
+            };
+            finish(resolve, db);
+          };
+          req.onerror = function () { finish(reject, req.error || new Error('idb-error')); };
+          req.onblocked = function () { finish(reject, new Error('idb-blocked')); };
         });
+        // 失败/阻塞后清空单例缓存，使下次调用能重试，而不是永久记住坏状态
+        dbPromise.catch(function () { dbPromise = null; });
       }
       return dbPromise;
     }
@@ -285,8 +373,12 @@
     }
     return {
       // item: {occurred_at, content, is_work, link, latitude, longitude, files:[{name,type,blob}], created_at}
+      // A7-01：entry_id 为「记录已在服务端建成」的中间态，重试时据此跳过创建，避免重复记录
       add: function (item) {
         return tx('readwrite', function (s) { s.add(item); });
+      },
+      put: function (item) {
+        return tx('readwrite', function (s) { s.put(item); });
       },
       all: function () {
         return open().then(function (db) {
@@ -371,6 +463,9 @@
       if (out && typeof out.then === 'function') out = await out;
       var svg = typeof out === 'string' ? out : (out && out.svg);
       if (!svg) return null;
+      // A8-14：mermaid 在语法异常/超限时会返回一张「错误示意图」SVG 而不是抛异常，
+      // 过去会把它当成功结果注入，与本函数「绝不显示 mermaid 报错图」的意图相反。
+      if (/aria-roledescription="error"|Syntax error in text|mermaid version/i.test(svg)) return null;
       if (window.DOMPurify) {
         svg = window.DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
       }
@@ -381,10 +476,12 @@
   }
 
   // 清洗 AI 给的 mindmap 代码：去围栏、统一换行、trim；必须以 mindmap 开头
+  var MINDMAP_MAX_CHARS = 8000; // A8-14：AI 输出无长度上限，超长会在主线程解析/布局造成卡顿
   function cleanMindmapCode(raw) {
     var code = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n');
     code = code.split('\n').filter(function (l) { return !/^\s*```/.test(l); }).join('\n').trim();
     if (!/^mindmap\b/.test(code)) throw new Error('not a mindmap');
+    if (code.length > MINDMAP_MAX_CHARS) throw new Error('mindmap too large'); // 走大纲树回退
     return code;
   }
 
@@ -448,24 +545,56 @@
   }
   function hideOverlay() { $('#overlay-root').innerHTML = ''; }
 
-  function closeModal() { $('#modal-root').innerHTML = ''; }
+  /* #modal-root 是全站唯一的模态容器，多类弹窗共用。
+   * A7-07：Escape / 路由切换过去只清 DOM 不 resolve，await 会永久挂起 →
+   *        统一由 closeModal 收敛挂起的 resolver。
+   * A7-19：异步流程里迟到的 closeModal() 会误关用户此刻打开的另一个弹窗 →
+   *        打开时发一个自增 token，closeModal(token) 只关自己那个。 */
+  var modalSerial = 0;
+  var modalPending = null; // { token, resolve }
+  function openModalRoot() {
+    var token = ++modalSerial;
+    // 新弹窗顶掉旧弹窗时，先把旧的 Promise 收敛，避免闭包与 await 永久悬挂
+    if (modalPending) { var old = modalPending; modalPending = null; old.resolve(null); }
+    return { token: token, root: $('#modal-root') };
+  }
+  // 省略 token = 无条件关闭（路由切换 / 全局 Escape）；带 token = 只关自己的那个
+  function closeModal(token) {
+    if (token != null && token !== modalSerial) return false;
+    if (modalPending) { var p = modalPending; modalPending = null; p.resolve(null); }
+    $('#modal-root').innerHTML = '';
+    return true;
+  }
 
   // 通用弹窗：resolve(输入值 / true / null)
+  var MODAL_INPUT_TYPES = { text: 1, password: 1, number: 1, date: 1, url: 1 };
   function inputModal(opts) {
     return new Promise(function (resolve) {
-      var root = $('#modal-root');
+      var m = openModalRoot();
+      var root = m.root;
+      var type = MODAL_INPUT_TYPES[opts.type] ? opts.type : 'text'; // A7-15：type 白名单
+      modalPending = { token: m.token, resolve: resolve };
+      // A7-15：body 仅允许硬编码 / 已转义的 HTML（高风险通道）；纯文本请用 bodyText
+      var bodyHtml = (opts.bodyText != null)
+        ? '<p class="modal-text">' + esc(opts.bodyText) + '</p>'
+        : (opts.body || '');
       root.innerHTML =
         '<div class="modal-wrap"><div class="modal">' +
         '<h3 class="modal-title">' + esc(opts.title || '') + '</h3>' +
-        (opts.body || '') +
+        bodyHtml +
         (opts.input !== false
-          ? '<input class="input" id="modal-input" type="' + esc(opts.type || 'text') + '" placeholder="' + esc(opts.placeholder || '') + '" value="' + esc(opts.value || '') + '">'
+          ? '<input class="input" id="modal-input" type="' + esc(type) + '" placeholder="' + esc(opts.placeholder || '') + '" value="' + esc(opts.value || '') + '">'
           : '') +
         '<div class="modal-btns">' +
         '<button class="btn btn-ghost" id="modal-cancel">' + esc(opts.cancelText || '取消') + '</button>' +
         '<button class="btn" id="modal-ok">' + esc(opts.okText || '确定') + '</button>' +
         '</div></div></div>';
-      var done = function (v) { closeModal(); resolve(v); };
+      // done 带自己的 token：即使此刻已被别的弹窗顶掉，也不会误关别人的
+      var done = function (v) {
+        if (modalPending && modalPending.token === m.token) modalPending = null;
+        closeModal(m.token);
+        resolve(v);
+      };
       $('#modal-cancel').onclick = function () { done(null); };
       $('.modal-wrap', root).addEventListener('click', function (e) {
         if (e.target.classList.contains('modal-wrap')) done(null);
@@ -484,7 +613,8 @@
   function confirmModal(text, okText) {
     return inputModal({
       title: '请确认',
-      body: '<p class="modal-text">' + esc(text) + '</p>',
+      // A7-15：纯文本走 bodyText，由弹窗内部 esc，避免调用方忘记转义
+      bodyText: text,
       input: false,
       okText: okText || '确定'
     }).then(function (v) { return v === true; });
@@ -493,7 +623,9 @@
   // 多选一弹窗：choices: [{label, sub?, value, primary?}]，resolve(选中 value / null)
   function choiceModal(opts) {
     return new Promise(function (resolve) {
-      var root = $('#modal-root');
+      var m = openModalRoot();
+      var root = m.root;
+      modalPending = { token: m.token, resolve: resolve };
       var btns = opts.choices.map(function (c, i) {
         return '<button class="btn ' + (c.primary ? '' : 'btn-ghost') + '" data-ch="' + i + '">' + esc(c.label) +
           (c.sub ? '<span class="choice-sub">' + esc(c.sub) + '</span>' : '') + '</button>';
@@ -501,11 +633,16 @@
       root.innerHTML =
         '<div class="modal-wrap"><div class="modal">' +
         '<h3 class="modal-title">' + esc(opts.title || '') + '</h3>' +
-        (opts.body || '') +
+        // body：仅允许硬编码 / 已转义的 HTML（高风险通道）；需要纯文本请用 bodyText
+        (opts.bodyText != null ? '<p class="modal-text">' + esc(opts.bodyText) + '</p>' : (opts.body || '')) +
         '<div class="modal-btns modal-btns-col">' + btns +
         '<button class="btn btn-ghost" data-ch="-1">' + esc(opts.cancelText || '取消') + '</button>' +
         '</div></div></div>';
-      var done = function (v) { closeModal(); resolve(v); };
+      var done = function (v) {
+        if (modalPending && modalPending.token === m.token) modalPending = null;
+        closeModal(m.token);
+        resolve(v);
+      };
       $$('#modal-root [data-ch]').forEach(function (b) {
         b.onclick = function () {
           var i = Number(b.dataset.ch);
@@ -545,6 +682,7 @@
   var closeQcPop = null; // 当前打开的「+」浮层关闭器（renderToday 赋值）
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape') {
+      // A7-07：closeModal 会一并 resolve 挂起的弹窗 Promise（不传 token = 无条件关闭）
       closeLightbox();
       closeModal();
       if (closeQcPop) closeQcPop();
@@ -571,8 +709,10 @@
   // 记录条目（今天时间线 / 记录列表 / 日历当日列表共用）
   function entryItemHtml(e, opts) {
     opts = opts || {};
+    // A8-08：缩略图缺失时不再回退原图（手机拍摄的单张 3–8MB，4 图缩略条会整张解码）。
+    // 没有缩略图的附件直接不进这条装饰性缩略条。
     var thumbs = (e.attachments || []).filter(function (a) {
-      return a.kind === 'image' || (a.kind === 'video' && a.thumb_url);
+      return !!a.thumb_url && (a.kind === 'image' || a.kind === 'video');
     }).slice(0, 4);
     var title = e.title || (e.content ? String(e.content).split('\n')[0].slice(0, 60) : '') || '（无标题）';
     var excerpt = e.summary || (e.content ? String(e.content).replace(/\s+/g, ' ').slice(0, 90) : '');
@@ -586,7 +726,8 @@
         return '<span class="ei-cat">' + esc(c.name_zh || c.name || c.slug || c) + '</span>';
       }).join('') + '</div>';
     }
-    return '<a class="entry-item" href="#/entry/' + encodeURIComponent(e.id) + '">' +
+    return '<a class="entry-item" href="#/entry/' + encodeURIComponent(e.id) + '"' +
+      (opts.showRel && e.occurred_at ? ' data-occurred="' + esc(e.occurred_at) + '"' : '') + '>' +
       '<div class="ei-top">' +
       '<span class="ei-time">' + esc(timeLabel) + '</span>' +
       (e.is_work ? '<span class="ei-work" title="工作">工作</span>' : '') +
@@ -599,7 +740,9 @@
         ? '<div class="ei-tags">' + e.tags.map(function (t) { return '<span class="tag">#' + esc(t) + '</span>'; }).join('') + '</div>'
         : '') +
       (thumbs.length
-        ? '<div class="ei-thumbs">' + thumbs.map(function (a) { return '<img loading="lazy" src="' + esc(a.thumb_url || a.url) + '" alt="">'; }).join('') + '</div>'
+        ? '<div class="ei-thumbs">' + thumbs.map(function (a) {
+            return '<img loading="lazy" decoding="async" src="' + esc(a.thumb_url) + '" alt="">';
+          }).join('') + '</div>'
         : '') +
       '</a>';
   }
@@ -609,10 +752,14 @@
     opts = opts || {};
     var inner;
     if (a.kind === 'image') {
-      inner = '<img loading="lazy" src="' + esc(a.thumb_url || a.url) + '" alt="' + esc(a.filename || '') + '">';
+      // A8-08：缩略图缺失时不再回退原图——手机拍摄的单张 3–8MB，一页 100 张即数百 MB
+      // 流量与 100 张全分辨率位图解码。改为占位图标，点开才加载原图。
+      inner = a.thumb_url
+        ? '<img loading="lazy" decoding="async" src="' + esc(a.thumb_url) + '" alt="' + esc(a.filename || '') + '">'
+        : '<span class="att-ic"><svg class="ic"><use href="#i-img"/></svg></span>';
     } else if (a.kind === 'video') {
       inner = (a.thumb_url
-        ? '<img loading="lazy" src="' + esc(a.thumb_url) + '" alt="">'
+        ? '<img loading="lazy" decoding="async" src="' + esc(a.thumb_url) + '" alt="">'
         : '<span class="att-ic"><svg class="ic"><use href="#i-video"/></svg></span>') + '<span class="play-dot"></span>';
     } else {
       inner = '<span class="att-ic"><svg class="ic"><use href="#i-file"/></svg></span>';
@@ -628,9 +775,11 @@
   }
 
   // URL 协议白名单：仅允许站内路径与 http(s)，防止 javascript: 等协议
+  // A7-21：原正则的 `/` 分支同时放行了协议相对 URL（//evil.com/x），
+  // 用 `/(?!\/)` 排除，避免将来后端 url 字段被污染时成为外链注入点。
   function safeUrl(url) {
     var u = String(url == null ? '' : url).trim();
-    return (/^(https?:\/\/|\/)/i.test(u)) ? u : '';
+    return (/^(https?:\/\/[^/]|\/(?!\/))/i.test(u)) ? u : '';
   }
 
   // 附件磁贴点击：铅笔改名；图片/视频走原有弹层；文件与音频走应用内预览
@@ -713,6 +862,11 @@
       lb.innerHTML = '<div class="pv-box">' + head + '<pre class="pv-text">正在读取…</pre></div>';
       closeBtn();
       fetch(url).then(function (res) {
+        // A7-13：锁屏时把 locked 当文件内容显示是错的；统一弹锁屏并给中文提示
+        if (res.status === 401) {
+          handleAuthStatus(401, 'locked');
+          throw new Error(LOCKED_MSG);
+        }
         if (!res.ok) throw new Error('读取失败（' + res.status + '）');
         return res.text();
       }).then(function (text) {
@@ -789,7 +943,37 @@
     };
   }
 
+  /* ---- 页面级资源清理（A7-23 / A7-28 / A9-08 / A9-32） ----
+   * 过去只有图表有注册表：定时器、IntersectionObserver 靠各自的路由判断散落清理，
+   * 漏一处就泄漏。这里统一登记，route() 切换页面时一次性执行。 */
+  var pageCleanups = [];
+  function onPageCleanup(fn) { if (typeof fn === 'function') pageCleanups.push(fn); }
+  // 页面级定时器：切页自动清理，避免离开今天页/设置页仍在跑
+  function pageTimeout(fn, ms) {
+    var id = setTimeout(function () {
+      pageCleanups = pageCleanups.filter(function (f) { return f !== cancel; });
+      fn();
+    }, ms);
+    var cancel = function () { clearTimeout(id); };
+    onPageCleanup(cancel);
+    return id;
+  }
+  function runPageCleanups() {
+    var list = pageCleanups;
+    pageCleanups = [];
+    list.forEach(function (fn) { try { fn(); } catch (e) { /* 忽略 */ } });
+  }
+
+  // A9-01：记录详情页脏状态（模块级，供 hashchange / beforeunload 拦截）
+  var entryDirty = false;
+  var entryDirtyId = null;
+  var entryLeaveOk = false;
+
   async function route() {
+    // A7-06 / A7-18：切页前先把今天页的草稿同步落一次（此刻 DOM 还在），
+    // 否则 300ms 防抖内的改动会随 DOM 一起消失
+    try { flushQcDraftSync(); } catch (e) { /* 忽略 */ }
+    runPageCleanups();
     disposeCharts();
     closeLightbox();
     closeModal();
@@ -816,11 +1000,53 @@
     }
   }
 
-  window.addEventListener('hashchange', route);
+  /* ---- 全局错误兜底（A7-20 / A9-28） ----
+   * 大量异步逻辑直接挂在事件处理器上（onclick = async function），异常会成为
+   * 无人处理的 rejection：用户侧表现为「点了没反应」，控制台才有红字。 */
+  window.addEventListener('unhandledrejection', function (e) {
+    var reason = e && e.reason;
+    var msg = (reason && reason.message) || '操作没有完成，请重试';
+    if (reason) { try { console.error('[小满] 未处理的异步错误', reason); } catch (err) { /* 忽略 */ } }
+    toast(msg, 'error');
+  });
+
+  /* ---- 记录详情脏保护（A9-01） ----
+   * 详情页是可编辑表单却没有任何离开保护：点返回 / 点导航 / 浏览器后退都会静默丢弃修改。 */
+  var hashGuard = false; // 回退 hash 时抑制二次询问
+  window.addEventListener('hashchange', async function () {
+    if (hashGuard) { hashGuard = false; return; }
+    if (entryDirty && !entryLeaveOk) {
+      var prev = entryDirtyId ? ('#/entry/' + encodeURIComponent(entryDirtyId)) : '#/entries';
+      var ok = await confirmModal('这条记录有还没保存的修改，离开后会丢失。要离开吗？', '放弃修改并离开');
+      if (!ok) {
+        hashGuard = true;
+        location.hash = prev;
+        return;
+      }
+      markEntryClean();
+    }
+    route();
+  });
+
+  window.addEventListener('beforeunload', function (e) {
+    if (!entryDirty) return undefined;
+    e.preventDefault();
+    e.returnValue = ''; // 触发浏览器原生「离开此页面？」确认
+    return '';
+  });
+
+  function markEntryDirty(id) { entryDirty = true; entryDirtyId = id || null; }
+  function markEntryClean() { entryDirty = false; entryDirtyId = null; entryLeaveOk = false; }
 
   /* ================= 今天页 ================= */
   // is_work：null=交给小满判断（默认），true=用户点亮了「工作」
   var qc = { files: [], link: '', is_work: null };
+  // A7-28：字段级复位，避免替换 qc 引用让持有旧引用的闭包读写到另一个对象
+  function qcReset() { qc.files = []; qc.link = ''; qc.is_work = null; }
+  // A7-05：真正的重入锁（btn.disabled 只挡鼠标，挡不住 Ctrl+Enter 与长按自动重复）
+  var qcSaving = false;
+  // A7-06：草稿恢复的附件（File 无法进 localStorage）：仅当前会话内存恢复，并提示用户
+  var qcDraftFiles = [];
 
   // 「工作」开关的界面同步（点亮/熄灭 + 旁边小字）
   function syncQcWorkPill() {
@@ -867,25 +1093,62 @@
   }
 
   /* ---- 快速记录草稿（localStorage，300ms 防抖） ---- */
+  // A7-10：超过 24 小时的陈旧草稿不自动恢复（改写笔记却记成今天）
+  var QC_DRAFT_TTL = 24 * 3600 * 1000;
   var qcDraftTimer = null;
+  function draftSnapshot() {
+    var textEl = $('#qc-text');
+    return textEl ? textEl.value : '';
+  }
+  // 真正写一次草稿（供防抖与页面隐藏时的同步 flush 共用）
+  function writeQcDraftNow(silent) {
+    // 防抖回调可能在切页之后才触发：此时今天页已不在，写下去只会得到一份假草稿
+    if (!$('#qc-text')) return;
+    var text = draftSnapshot();
+    var files = qc.files || [];
+    var whenEl = $('#qc-when');
+    try {
+      // A7-06：附件与补记日期都要进草稿；「只选了附件」也不能删草稿
+      if (!text.trim() && !qc.link && !files.length) {
+        localStorage.removeItem('qc_draft');
+        return;
+      }
+      localStorage.setItem('qc_draft', JSON.stringify({
+        v: 2,
+        text: text,
+        is_work: qc.is_work,
+        link: qc.link,
+        when: whenEl ? whenEl.value : '',
+        // 附件只记元信息（File 无法序列化）；本会话内由 qc.files 兜住
+        files: files.map(function (f) { return { name: f.name, type: f.type, size: f.size, lastModified: f.lastModified }; }),
+        ts: Date.now()
+      }));
+    } catch (e) {
+      // A7-18：配额写满时不能静默——用户会以为草稿保住了
+      if (!silent && e && e.name === 'QuotaExceededError') {
+        toast('草稿存不下了（浏览器存储已满），请尽快保存', 'error', 5000);
+      }
+    }
+  }
   function saveQcDraft() {
     clearTimeout(qcDraftTimer);
-    qcDraftTimer = setTimeout(function () {
-      var textEl = $('#qc-text');
-      if (!textEl) return;
-      var text = textEl.value;
-      try {
-        if (!text.trim() && !qc.link) {
-          localStorage.removeItem('qc_draft');
-        } else {
-          localStorage.setItem('qc_draft', JSON.stringify({
-            text: text, is_work: qc.is_work, link: qc.link, ts: Date.now()
-          }));
-        }
-      } catch (e) { /* 存储失败就算了 */ }
-    }, 300);
+    qcDraftTimer = setTimeout(function () { writeQcDraftNow(false); }, 300);
   }
+  // A7-18：页面隐藏 / 切到后台时同步落一次，消掉 300ms 防抖窗口
+  function flushQcDraftSync() {
+    // 只有今天页真的挂载着才写：qc.link 会跨路由残留，
+    // 在别的页面触发会写出一份「空正文 + 陈旧链接」的假草稿
+    if (!$('#qc-text')) return;
+    clearTimeout(qcDraftTimer);
+    writeQcDraftNow(true);
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) flushQcDraftSync();
+  });
+  window.addEventListener('pagehide', flushQcDraftSync);
+
   function clearQcDraft() {
+    clearTimeout(qcDraftTimer);
     try { localStorage.removeItem('qc_draft'); } catch (e) { /* 忽略 */ }
   }
   function restoreQcDraft() {
@@ -894,7 +1157,26 @@
       var raw = localStorage.getItem('qc_draft');
       if (raw) d = JSON.parse(raw);
     } catch (e) { d = null; }
-    if (!d || (!d.text && !d.link)) return;
+    if (!d || (!d.text && !d.link && !(d.files && d.files.length))) return;
+    // A7-10：陈旧草稿不静默塞进输入框；给一条可点击的提示让用户自己决定
+    if (d.ts && Date.now() - d.ts > QC_DRAFT_TTL) {
+      var staleNote = $('#qc-draft-note');
+      if (staleNote) {
+        var when = parseDate(new Date(d.ts).toISOString());
+        staleNote.innerHTML = '有一份 ' + esc(when ? absDate(when.toISOString()) : '早先') +
+          ' 未保存的草稿。<button class="link-btn" id="qc-draft-restore">恢复</button>' +
+          '<button class="link-btn" id="qc-draft-drop">丢弃</button>';
+        staleNote.classList.remove('hidden');
+        var rBtn = $('#qc-draft-restore');
+        if (rBtn) rBtn.onclick = function () { applyQcDraft(d); staleNote.classList.add('hidden'); };
+        var dBtn = $('#qc-draft-drop');
+        if (dBtn) dBtn.onclick = function () { clearQcDraft(); staleNote.classList.add('hidden'); };
+      }
+      return;
+    }
+    applyQcDraft(d);
+  }
+  function applyQcDraft(d) {
     var textEl = $('#qc-text');
     if (!textEl) return;
     textEl.value = d.text || '';
@@ -902,10 +1184,22 @@
     // 旧草稿迁移：category=work → is_work=true，其余 → null（交给小满）
     if (typeof d.is_work === 'boolean') qc.is_work = d.is_work;
     else qc.is_work = d.category === 'work' ? true : null;
+    // A7-06：恢复补记日期（旧草稿没有 when 则保持默认的「现在」）
+    var whenEl = $('#qc-when');
+    if (whenEl && d.when) whenEl.value = d.when;
+    // 附件不可从 localStorage 还原：恢复本会话仍持有的 File（同页重渲染场景）
+    if (qcDraftFiles.length) qc.files = qcDraftFiles.slice();
     syncQcWorkPill();
     renderQcChips();
     var note = $('#qc-draft-note');
-    if (note) note.classList.remove('hidden');
+    if (note) {
+      var bits = [];
+      if (d.files && d.files.length) bits.push(d.files.length + ' 个附件');
+      if (d.when) bits.push('时间 ' + d.when.replace('T', ' '));
+      note.textContent = '已恢复未保存的草稿' + (bits.length ? '（含 ' + bits.join('、') + '）' : '') +
+        (d.files && d.files.length && !qc.files.length ? '；附件需要重新选择' : '');
+      note.classList.remove('hidden');
+    }
   }
 
   /* ---- 今日节气（本地近似区间表） ---- */
@@ -942,7 +1236,12 @@
     var h = now.getHours();
     var greet = h < 5 ? '夜深了' : h < 12 ? '早上好' : h < 18 ? '下午好' : '晚上好';
     var line = warmLines[now.getDate() % warmLines.length];
-    qc = { files: [], link: '', is_work: null };
+    // A7-06：重渲染前先把本会话已选的附件留在内存里，供 restoreQcDraft 还原
+    // （File 无法进 localStorage）；再字段级复位 qc，不用整体替换引用（A7-28）。
+    qcDraftFiles = (qc.files || []).slice();
+    qcReset();
+    // A7-28：幂等清理上一轮的同步定时器，避免将来出现第二处 renderToday 调用点时叠加
+    if (todaySyncTimer) { clearInterval(todaySyncTimer); todaySyncTimer = null; }
 
     var dateLine = now.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' });
     view.innerHTML =
@@ -988,7 +1287,7 @@
       '</div></div>' +
       '</div>' +
       '<div class="qc-side">' +
-      '<input type="datetime-local" class="input qc-when" id="qc-when" title="记录时间（补写以前的日记就改这里）">' +
+      '<input type="datetime-local" class="input qc-when" id="qc-when" max="' + esc(toLocalInputValue()) + '" title="记录时间（补写以前的日记就改这里）">' +
       '<div class="qc-cats">' +
       '<button class="pill qc-work-pill" id="qc-work" title="点亮表示这是工作；不点就是交给小满判断"><svg class="ic"><use href="#i-brief"/></svg>工作</button>' +
       '<span class="qc-work-hint" id="qc-work-hint">交给小满</span>' +
@@ -1016,13 +1315,19 @@
     function pickFile(accept, capture) {
       var inp = document.createElement('input');
       inp.type = 'file';
+      inp.style.display = 'none';
       if (accept) inp.accept = accept;
       if (capture) inp.setAttribute('capture', 'environment');
       else inp.multiple = true;
       inp.onchange = function () {
         var fs = Array.prototype.slice.call(inp.files || []);
-        if (fs.length) { qc.files = qc.files.concat(fs); renderQcChips(); }
+        // A7-17：先做大小预检，别等传完几分钟再被后端 413 拒绝
+        var usable = screenFiles(fs);
+        if (usable.length) { qc.files = qc.files.concat(usable); renderQcChips(); saveQcDraft(); }
+        inp.remove();
       };
+      // 部分移动浏览器要求 file input 挂在文档里才弹选择器
+      document.body.appendChild(inp);
       inp.click();
     }
     var mediaActions = {
@@ -1062,21 +1367,27 @@
       closeQcPop();
       mediaActions[item.dataset.act]();
     });
-    // 模板小节：往正文追加【标题】，并顺手点亮「工作」（可再点灭）
+    // 模板小节：往正文追加【标题】
+    // A7-14：过去这里硬编码 qc.is_work = true —— 后端只要收到 is_work 就写
+    // is_work_manual=1，此后 AI 永久不再重判这条，即「一次模板点击 = 一次不可逆的
+    // 人工语义定标」。模板只是插入文本的界面辅助动作，不再替用户决定工作属性。
     $('#qc-tpl').addEventListener('click', function (ev) {
       var btn = ev.target.closest('[data-tpl]');
       if (!btn) return;
       insertSection($('#qc-text'), btn.dataset.tpl);
-      qc.is_work = true;
-      syncQcWorkPill();
       saveQcDraft();
     });
-    // 补记用的时间选择，默认当前时间
-    $('#qc-when').value = toLocalInputValue();
+    // 补记用的时间选择：默认当前时间，但若刚恢复了含日期的草稿则保留草稿里的时间
+    if (!$('#qc-when').value) $('#qc-when').value = toLocalInputValue();
 
-    $('#qc-save').onclick = quickSave;
+    $('#qc-save').onclick = function () { quickSave(); };
     $('#qc-text').addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') quickSave();
+      // A7-05：e.repeat 掐掉长按自动重复；saving 布尔量做真正的重入锁
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        if (e.repeat || qcSaving) return;
+        quickSave();
+      }
     });
     // 输入框随内容长高，接近一屏高才出现内部滚动条
     var qcGrow = function () {
@@ -1095,6 +1406,23 @@
     updateSyncChip();
     flushOutboxSafe();
     todaySyncTimer = setInterval(flushOutboxSafe, 60000);
+    // A7-16：相对时间只在渲染那一刻算一次，停留一会儿就一直是「3 分钟前」。
+    // 用 60 秒定时器只更新 .ei-rel 文本，不整表重渲染。
+    var relTimer = setInterval(function () {
+      var box = $('#today-list');
+      if (!box) return;
+      $$('a.entry-item', box).forEach(function (a) {
+        var rel = a.querySelector('.ei-rel');
+        var iso = a.dataset.occurred;
+        if (rel && iso) rel.textContent = relTime(iso);
+      });
+    }, 60000);
+    onPageCleanup(function () { clearInterval(relTimer); });
+    // A7-30：移动端最典型的恢复路径是「从后台切回浏览器」，此时 online 事件不一定触发；
+    // visibilitychange 让「回到 Wi-Fi 自动同步」不再最多等 60 秒。
+    var visHandler = function () { if (!document.hidden) flushOutboxSafe(); };
+    document.addEventListener('visibilitychange', visHandler);
+    onPageCleanup(function () { document.removeEventListener('visibilitychange', visHandler); });
 
     // 小巧思：muse 一句 / 空白日轻提醒 / N 天前的今天（都安静、失败静默）
     api('/api/muse').then(function (m) {
@@ -1188,6 +1516,17 @@
   async function loadOnThisDay() {
     var slot = $('#otd-slot');
     if (!slot) return;
+    // A7-26：过去每次进入今天页都会串行发最多 3 个请求（今天页本来就有 12–15 个并发）。
+    // 结果按「当天」缓存在 sessionStorage，同一个会话里只查一次。
+    var skey = 'otd_cache_' + localDateStr();
+    try {
+      var cached = sessionStorage.getItem(skey);
+      if (cached != null) {
+        var c = JSON.parse(cached);
+        if (c && c.html) slot.innerHTML = c.html;
+        return;
+      }
+    } catch (e) { /* 忽略，走正常查询 */ }
     try {
       for (var i = 1; i <= 3; i++) {
         var n = i * 30;
@@ -1198,11 +1537,15 @@
         if (item) {
           if (!document.body.contains(slot)) return;
           var title = item.title || (item.content ? String(item.content).split('\n')[0].slice(0, 40) : '') || '（无标题）';
-          slot.innerHTML = '<a class="otd-card" href="#/entry/' + encodeURIComponent(item.id) + '">' +
+          var html = '<a class="otd-card" href="#/entry/' + encodeURIComponent(item.id) + '">' +
             n + ' 天前的今天，你记了：《' + esc(title) + '》 →</a>';
+          slot.innerHTML = html;
+          try { sessionStorage.setItem(skey, JSON.stringify({ html: html })); } catch (e2) { /* 忽略 */ }
           return;
         }
       }
+      // 三天都没有：也缓存空结果，避免每次进页面都重查
+      try { sessionStorage.setItem(skey, JSON.stringify({ html: '' })); } catch (e3) { /* 忽略 */ }
     } catch (e) { /* 静默 */ }
   }
 
@@ -1340,6 +1683,10 @@
 
   /* ---- 对话式记录：让小满问我两句 ---- */
   var ckHistory = [];
+  // A7-25：历史无上限时每轮请求体与 token 成本无界增长；只保留最近 20 条
+  var CK_HISTORY_MAX = 20;
+  var ckToken = null;   // 本对话弹窗的 modal token（A7-19：迟到的 closeModal 不误关别人的弹窗）
+  var ckBusy = false;   // A7-25：in-flight 守卫，防连点产生并发请求与乱序历史
 
   function ckBubble(role, text) {
     var flow = $('#ck-flow');
@@ -1362,7 +1709,7 @@
     try {
       var r = await api('/api/checkin', {
         method: 'POST',
-        body: { history: ckHistory },
+        body: { history: ckHistory.slice(-CK_HISTORY_MAX) },
         timeout: 120000
       });
       loading.remove();
@@ -1381,7 +1728,7 @@
           }
         });
         toast('已经帮你记下来了', 'success');
-        closeModal();
+        closeModal(ckToken); // A7-19：只关本对话弹窗
         loadTodayList();
       }
     } catch (e) {
@@ -1391,12 +1738,19 @@
       } else {
         toast(e.message, 'error');
       }
+    } finally {
+      ckBusy = false;
+      var sBtn = $('#ck-send');
+      if (sBtn) sBtn.disabled = false;
     }
   }
 
   function openCheckin() {
     ckHistory = [];
-    var root = $('#modal-root');
+    ckBusy = false;
+    var m = openModalRoot();
+    ckToken = m.token;
+    var root = m.root;
     root.innerHTML =
       '<div class="modal-wrap"><div class="modal checkin-modal">' +
       '<h3 class="modal-title">小满想问你两句</h3>' +
@@ -1410,61 +1764,126 @@
       '<button class="link-btn" id="ck-close">先聊到这</button>' +
       '</div></div></div>';
     $('.modal-wrap', root).addEventListener('click', function (e) {
-      if (e.target.classList.contains('modal-wrap')) closeModal();
+      if (e.target.classList.contains('modal-wrap')) closeModal(ckToken);
     });
-    $('#ck-close').onclick = closeModal;
+    $('#ck-close').onclick = function () { closeModal(ckToken); };
     $('#ck-finish').onclick = function () {
+      if (ckBusy) return;
       ckHistory.push({ role: 'user', content: '我想先聊到这里，请帮我总结并保存。' });
       ckBubble('user', '我想先聊到这里，请帮我总结并保存。');
       ckTurn();
     };
     var send = function () {
+      if (ckBusy) return; // A7-25：已有回合在途时忽略，避免并发与历史乱序
       var inp = $('#ck-input');
       var text = inp.value.trim();
       if (!text) return;
       inp.value = '';
       ckHistory.push({ role: 'user', content: text });
+      if (ckHistory.length > CK_HISTORY_MAX) ckHistory = ckHistory.slice(-CK_HISTORY_MAX);
       ckBubble('user', text);
+      ckBusy = true;
+      $('#ck-send').disabled = true;
       ckTurn();
     };
     $('#ck-send').onclick = send;
     $('#ck-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') send(); });
     $('#ck-input').focus();
+    ckBusy = true;
     ckTurn(); // 空 history 先拿开场白
   }
 
   function renderQcChips() {
     var box = $('#qc-chips');
     if (!box) return;
+    // A7-17：显示体积，让「离线暂存会占多少手机空间」可见
     var html = qc.files.map(function (f, i) {
-      return '<span class="qc-chip"><span>' + esc(f.name) + '</span><button data-rm-file="' + i + '" title="移除">×</button></span>';
+      return '<span class="qc-chip"><span>' + esc(f.name) + '</span>' +
+        (f.size ? '<span class="qc-chip-size">' + esc(fmtSize(f.size)) + '</span>' : '') +
+        '<button data-rm-file="' + i + '" title="移除">×</button></span>';
     }).join('');
     if (qc.link) {
       html += '<span class="qc-chip"><span>' + esc(qc.link) + '</span><button data-rm-link="1" title="移除">×</button></span>';
     }
     box.innerHTML = html;
     $$('#qc-chips [data-rm-file]').forEach(function (b) {
-      b.onclick = function () { qc.files.splice(Number(b.dataset.rmFile), 1); renderQcChips(); };
+      b.onclick = function () {
+        qc.files.splice(Number(b.dataset.rmFile), 1);
+        qcDraftFiles = qc.files.slice();
+        renderQcChips();
+        saveQcDraft();
+      };
     });
     var rl = $('#qc-chips [data-rm-link]');
-    if (rl) rl.onclick = function () { qc.link = ''; renderQcChips(); };
+    if (rl) rl.onclick = function () { qc.link = ''; renderQcChips(); saveQcDraft(); };
+  }
+
+  // A7-12：不依赖 new Date('YYYY-MM-DDTHH:mm') 的跨浏览器解析行为，
+  // 手工拆字段后用本地时间构造，彻底消除「补记时间静默变成现在」的时区歧义。
+  function parseLocalInput(v) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(String(v == null ? '' : v));
+    if (!m) return null;
+    var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), 0, 0);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // 保存成功 / 入队成功后统一复位输入区（避免各处重复且漏项）
+  function resetQcInputs(textEl) {
+    textEl = textEl || $('#qc-text');
+    if (textEl) { textEl.value = ''; textEl.style.height = 'auto'; }
+    qcReset();
+    qcDraftFiles = [];
+    syncQcWorkPill();
+    renderQcChips();
+    clearQcDraft();
+    var whenEl = $('#qc-when');
+    if (whenEl) whenEl.value = toLocalInputValue();
   }
 
   async function quickSave() {
-    var textEl = $('#qc-text');
-    var text = textEl.value.trim();
-    if (!text && !qc.files.length) { toast('先写点什么，或添加一个附件吧', 'error'); return; }
+    // A7-05：keydown 的 Ctrl+Enter 靠 e.repeat 挡长按，但快速连按仍需真正的重入锁
+    if (qcSaving) return;
+    qcSaving = true;
     var btn = $('#qc-save');
-    btn.disabled = true;
-    btn.textContent = '保存中…';
-    var created = null; // 记录是否已在服务端建成（避免附件失败时重复入 outbox）
-    // 补记：用选择器里的时间作为发生时间（空则现在）
-    var whenVal = ($('#qc-when') && $('#qc-when').value) || '';
-    var occurred = whenVal ? new Date(whenVal) : new Date();
-    if (isNaN(occurred.getTime())) occurred = new Date();
-    var pastDate = localDateStr(occurred) !== localDateStr();
-    var occurredIso = occurred.toISOString();
+    var textEl = $('#qc-text');
     try {
+      // A7-20：try 从函数首行开始，DOM 被路由替换时不会变成无人处理的 rejection
+      var text = textEl.value.trim();
+      if (!text && !qc.files.length) { toast('先写点什么，或添加一个附件吧', 'error'); return; }
+      if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+      var created = null; // 记录是否已在服务端建成（避免附件失败时重复入 outbox）
+      // 补记：用选择器里的时间作为发生时间（空则现在）
+      var whenVal = ($('#qc-when') && $('#qc-when').value) || '';
+      var occurred = whenVal ? parseLocalInput(whenVal) : new Date();
+      if (whenVal && !occurred) toast('时间格式没读出来，将按现在保存', 'error', 4000);
+      if (!occurred) occurred = new Date();
+      var todayStr = localDateStr();
+      var occurredDay = localDateStr(occurred);
+      var isPast = occurredDay < todayStr;
+      var isFuture = occurredDay > todayStr;
+      var occurredIso = occurred.toISOString();
+
+      // A7-02：离线时不必先等 30 秒超时，直接走本地暂存
+      var offline = false;
+      try { offline = navigator.onLine === false; } catch (e0) { offline = false; }
+      if (offline) {
+        await outbox.add({
+          occurred_at: occurredIso,
+          content: text,
+          is_work: qc.is_work === true ? true : null,
+          link: qc.link || '',
+          latitude: window.__geo ? window.__geo.lat : null,
+          longitude: window.__geo ? window.__geo.lon : null,
+          files: qc.files.map(function (f) { return { name: f.name, type: f.type, blob: f }; }),
+          attempts: 0,
+          created_at: new Date().toISOString()
+        });
+        resetQcInputs(textEl);
+        toast('现在没连上电脑，已先保存在这台手机上，连上 Wi-Fi 后会自动同步', 'success', 5000);
+        updateSyncChip();
+        return;
+      }
+
       // is_work 只在用户点过「工作」开关时携带；其余交给小满判断
       var payload = {
         occurred_at: occurredIso, content: text,
@@ -1475,14 +1894,15 @@
       var entry = await api('/api/entries', { method: 'POST', body: payload });
       created = entry;
       if (qc.files.length) {
-        $('#qc-progress').classList.remove('hidden');
+        var prog = $('#qc-progress');
+        if (prog) prog.classList.remove('hidden');
         var bar0 = $('#qc-bar');
         if (bar0) bar0.style.width = '0';
         entry = await uploadFiles(entry.id, qc.files, function (pct) {
           var bar = $('#qc-bar');
           if (bar) bar.style.width = pct + '%';
         });
-        $('#qc-progress').classList.add('hidden');
+        if (prog) prog.classList.add('hidden');
       }
       if (qc.link) {
         try {
@@ -1505,19 +1925,15 @@
       } catch (e) { /* 统计失败就用普通提示 */ }
       if (celebrate) {
         toast(celebrate, 'success', 5000);
-      } else if (pastDate) {
+      } else if (isPast) {
         toast('已补记到 ' + (occurred.getMonth() + 1) + '月' + occurred.getDate() + '日', 'success');
+      } else if (isFuture) {
+        toast('已记下（这条时间在未来）', 'success');
       } else {
         toast('已记下，继续加油', 'success');
       }
-      textEl.value = '';
-      textEl.style.height = 'auto';
-      qc = { files: [], link: '', is_work: null };
-      syncQcWorkPill();
-      renderQcChips();
-      clearQcDraft();
-      if ($('#qc-when')) $('#qc-when').value = toLocalInputValue();
-      if (!pastDate) prependTodayItem(entry);
+      resetQcInputs(textEl);
+      if (!isPast && !isFuture) prependTodayItem(entry);
       // 标题/摘要为空的，后台小模型会补：轮询两次，好了就更新界面
       if (!entry.title || !entry.summary) pollAutoFill(entry.id, { context: 'today' });
     } catch (e) {
@@ -1532,37 +1948,35 @@
             latitude: window.__geo ? window.__geo.lat : null,
             longitude: window.__geo ? window.__geo.lon : null,
             files: qc.files.map(function (f) { return { name: f.name, type: f.type, blob: f }; }),
+            attempts: 0,
             created_at: new Date().toISOString()
           });
-          textEl.value = '';
-      textEl.style.height = 'auto';
-          qc = { files: [], link: '', is_work: null };
-          syncQcWorkPill();
-          renderQcChips();
-          clearQcDraft();
-          if ($('#qc-when')) $('#qc-when').value = toLocalInputValue();
+          resetQcInputs(textEl);
           toast('现在没连上电脑，已先保存在这台手机上，连上 Wi-Fi 后会自动同步', 'success', 5000);
           updateSyncChip();
         } catch (idbErr) {
           toast('离线保存也失败了：' + ((idbErr && idbErr.message) || idbErr), 'error');
         }
-      } else if (e.isNetwork && created) {
-        toast('记录已保存，但附件没传上去，联网后请在详情页重新上传', 'error', 5000);
-        textEl.value = '';
-      textEl.style.height = 'auto';
-        qc = { files: [], link: '', is_work: null };
-        syncQcWorkPill();
-        renderQcChips();
-        clearQcDraft();
-        if (!pastDate) prependTodayItem(created);
+      } else if (created) {
+        // A7-04：记录已在服务端建成，任何后续失败都必须复位输入区，
+        // 否则用户点「重试」会又 POST 一条内容相同的记录（每点一次多一条）。
+        resetQcInputs(textEl);
+        if (!isPast && !isFuture) prependTodayItem(created);
+        if (e.isNetwork) {
+          toast('记录已保存，但附件没传上去，联网后请在详情页重新上传', 'error', 5000);
+        } else {
+          // 413 超限 / 400 图片损坏等业务拒绝：把具体原因说清楚
+          toast('记录已保存，但附件没传上去：' + e.message + '。可到详情页重新上传', 'error', 6000);
+        }
       } else {
+        // 记录本身没建成（多为 400 校验失败）：保留输入让用户修正后重试
         toast(e.message, 'error');
       }
     } finally {
-      btn.disabled = false;
-      btn.textContent = '记下这一刻';
-      var prog = $('#qc-progress');
-      if (prog) prog.classList.add('hidden');
+      qcSaving = false;
+      if (btn) { btn.disabled = false; btn.textContent = '记下这一刻'; }
+      var prog2 = $('#qc-progress');
+      if (prog2) prog2.classList.add('hidden');
     }
   }
 
@@ -1572,9 +1986,11 @@
     inp.type = 'file';
     inp.accept = 'image/*';
     inp.multiple = true;
+    inp.style.display = 'none';
     // 不设 capture：手机会弹出"拍照/相册"选择，相册里可多选几页一起识别
     inp.onchange = async function () {
       var files = inp.files ? Array.prototype.slice.call(inp.files) : [];
+      inp.remove();
       if (!files.length) return;
       if (files.length > 9) { toast('一次最多识别 9 页，请分批上传', 'error', 5000); return; }
       showOverlay(files.length > 1
@@ -1608,49 +2024,94 @@
   /* ---- 待同步 chip 与 outbox 冲刷 ---- */
   var todaySyncTimer = null;
   var flushing = false;
+  var flushingAt = 0;
+  var FLUSH_STALE_MS = 5 * 60 * 1000; // 软锁：一次冲刷超过 5 分钟视为已死，释放锁
+  var OUTBOX_MAX_ATTEMPTS = 5;        // 超过阈值的条目移到「同步失败」，不再阻塞队列
+  var outboxFailedCount = 0;          // 同步失败（需人工处理）的条数，chip 上分开显示
 
   async function updateSyncChip() {
     var slot = $('#sync-slot');
     if (!slot) return;
-    var n = await outbox.count();
+    var n = 0, failed = 0;
+    try {
+      var list = await outbox.all();
+      list.forEach(function (x) { if (x.failed) failed++; else n++; });
+    } catch (e) {
+      n = await outbox.count();
+    }
+    outboxFailedCount = failed;
     if (!document.body.contains(slot)) return;
-    if (n > 0) {
-      slot.innerHTML = '<button class="sync-chip" id="sync-chip">☁ ' + n + ' 条待同步，点我重试</button>';
-      $('#sync-chip').onclick = flushOutboxSafe;
+    // A7-24：await 期间队列可能已变化，用 count 结果渲染前再做一次存在性 + 状态校验
+    if (flushing) {
+      slot.innerHTML = '<button class="sync-chip" id="sync-chip" disabled>☁ 正在同步…</button>';
+      return;
+    }
+    if (n > 0 || failed > 0) {
+      var parts = [];
+      if (n > 0) parts.push(n + ' 条待同步');
+      if (failed > 0) parts.push(failed + ' 条同步失败');
+      slot.innerHTML = '<button class="sync-chip" id="sync-chip">☁ ' + esc(parts.join(' · ')) + '，点我重试</button>';
+      var chip = $('#sync-chip');
+      if (chip) {
+        chip.onclick = function () {
+          // A7-24：冲刷进行中点击给一次轻反馈，别让用户以为按钮坏了
+          if (flushing) { toast('正在同步中，请稍候…', 'info'); return; }
+          flushOutboxSafe();
+        };
+      }
     } else {
       slot.innerHTML = '';
     }
   }
 
   async function flushOutbox() {
-    if (flushing) return;
+    // A7-03 / A7-08：带时间戳的软锁——一次挂起（IDB 阻塞 / XHR 永不 settle）
+    // 不再永久锁死整条同步链路，超时后自动释放。
+    if (flushing && Date.now() - flushingAt < FLUSH_STALE_MS) return;
     flushing = true;
-    var done = 0, finished = false;
+    flushingAt = Date.now();
+    var done = 0, failed = 0, stoppedByNetwork = false;
     try {
       var items = await outbox.all();
       items.sort(function (a, b) { return a.id - b.id; });
       for (var i = 0; i < items.length; i++) {
         var it = items[i];
+        // A7-01：创建成功后立刻回写 entry_id —— 重试时据此跳过 POST，
+        // 避免「记录已建成、附件失败」的条目每轮重复插入一条新记录。
+        var entryId = it.entry_id || null;
         try {
-          var body = {
-            occurred_at: it.occurred_at,
-            content: it.content,
-            latitude: it.latitude == null ? undefined : it.latitude,
-            longitude: it.longitude == null ? undefined : it.longitude
-          };
-          if (it.is_work === true) body.is_work = true;
-          var entry = await api('/api/entries', { method: 'POST', body: body });
-          if (it.files && it.files.length) {
+          if (!entryId) {
+            var body = {
+              occurred_at: it.occurred_at,
+              content: it.content,
+              latitude: it.latitude == null ? undefined : it.latitude,
+              longitude: it.longitude == null ? undefined : it.longitude
+            };
+            if (it.is_work === true) body.is_work = true;
+            var entry = await api('/api/entries', { method: 'POST', body: body });
+            entryId = entry && entry.id;
+            if (!entryId) throw new Error('创建记录后没有拿到 id');
+            // 中间态落盘：即使随后附件失败或进程被杀，下一轮也不会重复创建
+            it.entry_id = entryId;
+            await outbox.put(it);
+          }
+          if (it.files && it.files.length && !it.files_uploaded) {
             var fs = it.files.map(function (f) {
               return new File([f.blob], f.name, { type: f.type || undefined });
             });
-            entry = await uploadFiles(entry.id, fs, null);
+            await uploadFiles(entryId, fs, null);
+            // 附件已传成功：落盘标记，避免重试时把同一批附件再传一遍（重复附件）
+            it.files_uploaded = true;
+            try { await outbox.put(it); } catch (e0) { /* 落盘失败不影响本轮成功 */ }
           }
-          if (it.link) {
+          if (it.link && !it.link_saved) {
             try {
-              entry = await api('/api/entries/' + encodeURIComponent(entry.id) + '/links', {
+              await api('/api/entries/' + encodeURIComponent(entryId) + '/links', {
                 method: 'POST', body: { url: it.link }
               });
+              // 与 files_uploaded 同理：链接已存成功就落盘标记，重试不再重复提交
+              it.link_saved = true;
+              try { await outbox.put(it); } catch (e0) { /* 落盘失败不影响本轮成功 */ }
             } catch (linkErr) {
               if (linkErr.isNetwork) throw linkErr;
               toast('有 1 条记录的链接没有同步成功：' + linkErr.message, 'error');
@@ -1659,19 +2120,43 @@
           await outbox.remove(it.id);
           done++;
         } catch (e) {
-          if (e.isNetwork) break; // 还是连不上：保留剩余，下轮再试
-          toast('同步中断：' + e.message, 'error');
-          break;
+          if (e.isNetwork) {
+            // 还是连不上：保留剩余，下轮再试（网络类不计入 attempts，避免弱网把条目打入死信）
+            stoppedByNetwork = true;
+            break;
+          }
+          // A7-01 / A7-09：业务错误不再 break（队头阻塞）——
+          // 记一次失败，达到阈值后标记为「同步失败」，用 continue 放行后续条目。
+          it.attempts = (it.attempts || 0) + 1;
+          it.last_error = e.message;
+          it.last_tried_at = new Date().toISOString();
+          if (it.attempts >= OUTBOX_MAX_ATTEMPTS) {
+            it.failed = true;
+            failed++;
+            try { await outbox.put(it); } catch (e2) { /* 忽略 */ }
+            toast('有 1 条记录同步不了（' + e.message + '），已跳过，不影响其它记录', 'error', 6000);
+          } else {
+            try { await outbox.put(it); } catch (e2) { /* 忽略 */ }
+            toast('这条暂时没同步上：' + e.message, 'error');
+          }
+          continue;
         }
-        finished = (i === items.length - 1);
       }
       if (done > 0) {
-        if (finished) toast('已把 ' + done + ' 条手机记录同步到电脑', 'success', 4500);
+        // A7-22：把「本轮是否还有剩余」说清楚，部分成功也要给提示
+        var rest = 0;
+        try { rest = await outbox.count(); } catch (e3) { rest = 0; }
+        if (!rest) toast('已把 ' + done + ' 条手机记录同步到电脑', 'success', 4500);
+        else toast('已同步 ' + done + ' 条，还有 ' + rest + ' 条' +
+          (stoppedByNetwork ? '（网络不稳，稍后自动继续）' : '（需人工处理）'), stoppedByNetwork ? 'info' : 'error', 6000);
         loadTodayList();
+      } else if (stoppedByNetwork) {
+        /* 全都没连上：安静等待下一轮，不刷屏 */
       }
       updateSyncChip();
     } finally {
       flushing = false;
+      flushingAt = 0;
     }
   }
 
@@ -1688,7 +2173,15 @@
         box.innerHTML = emptyHtml('今天还没有记录，写下第一句吧', '哪怕一句话，也是给未来的礼物');
         return;
       }
-      box.innerHTML = data.items.map(function (e) { return entryItemHtml(e, { showRel: true }); }).join('');
+      var html = data.items.map(function (e) { return entryItemHtml(e, { showRel: true }); }).join('');
+      // A7-16：超过 50 条时不再静默截断，至少明确告知并给出继续入口
+      if (data.total && data.total > data.items.length) {
+        html += '<div class="center"><button class="btn btn-ghost btn-sm" id="today-more">今天还有 ' +
+          esc(data.total - data.items.length) + ' 条，去记录页看全部</button></div>';
+      }
+      box.innerHTML = html;
+      var moreBtn = $('#today-more');
+      if (moreBtn) moreBtn.onclick = function () { location.hash = '#/entries'; };
     } catch (e) {
       box.innerHTML = errorHtml(e.message);
     }
@@ -1706,7 +2199,8 @@
     opts = opts || {};
     var done = false;
     [5000, 12000].forEach(function (ms) {
-      setTimeout(async function () {
+      // A7-23：定时器纳入页面级清理（route() 统一 clear），离开今天页后不再弹假提示
+      pageTimeout(async function () {
         if (done) return;
         var e;
         try { e = await api('/api/entries/' + encodeURIComponent(entryId)); } catch (err) { return; }
@@ -1715,17 +2209,25 @@
         var touched = false;
         if (opts.context === 'today') {
           var item = document.querySelector('#today-list a.entry-item[href="#/entry/' + encodeURIComponent(entryId) + '"]');
-          if (item) {
+          // A7-23：节点必须仍在文档中，否则 outerHTML 写的是分离节点 → 假成功提示
+          if (item && document.body.contains(item)) {
             item.outerHTML = entryItemHtml(e, { showRel: true });
             touched = true;
           }
         } else if (opts.context === 'entry') {
           if (currentEntry && String(currentEntry.id) === String(entryId) && $('#e-title')) {
-            currentEntry = e;
-            $('#e-title').value = e.title || '';
-            $('#e-summary').value = e.summary || '';
-            $('#e-tags').value = (e.tags || []).join(', ');
-            touched = true;
+            // A9-15：不覆盖用户在这 5–12 秒内手打的内容，只填空字段
+            var titleEl = $('#e-title'), sumEl = $('#e-summary'), tagEl = $('#e-tags');
+            var filled = false;
+            if (!titleEl.value.trim() && e.title) { titleEl.value = e.title; filled = true; }
+            if (sumEl && !sumEl.value.trim() && e.summary) { sumEl.value = e.summary; filled = true; }
+            if (tagEl && !tagEl.value.trim() && (e.tags || []).length) { tagEl.value = e.tags.join(', '); filled = true; }
+            if (filled) {
+              currentEntry = Object.assign({}, currentEntry, {
+                title: e.title, summary: e.summary, tags: e.tags, weather: e.weather
+              });
+              touched = true;
+            }
           }
         }
         if (touched) toast('小满帮你补好了标题和摘要', 'success');
@@ -1759,7 +2261,12 @@
     };
     // 天气开关关闭时：不请求定位，卡片保持隐藏（设置读取失败则按原流程静默尝试）
     api('/api/settings').then(function (st) {
-      if (st && st.weather_enabled === false) return;
+      if (st && st.weather_enabled === false) {
+        // A7-11：__geo 过去只赋值、从不清除。用户关掉定位后同一会话内继续记录，
+        // 仍会把上一次的经纬度写进新记录（与用户预期相反，且与地名自相矛盾）。
+        window.__geo = null;
+        return;
+      }
       doGeo();
     }).catch(function () { doGeo(); });
   }
@@ -1780,7 +2287,15 @@
         return '<option value="' + esc(c.slug) + '">' + esc(c.name_zh || c.slug) + '</option>';
       }).join('');
       if (entriesState && entriesState.category) sel.value = entriesState.category;
-    } catch (e) { /* 静默 */ }
+    } catch (e) {
+      // A8-20：过去静默失败会让下拉只剩「全部分类」，用户以为「没有类目」。
+      // 这里给出一个明确的占位项。
+      var sel2 = $('#f-cat');
+      if (sel2) {
+        sel2.innerHTML = '<option value="">全部分类（类目加载失败）</option>';
+        sel2.title = '类目读取失败：' + (e.message || '请稍后重试');
+      }
+    }
   }
 
   function categoryName(slug) {
@@ -1789,7 +2304,7 @@
   }
 
   async function renderEntries(view) {
-    entriesState = { q: '', category: '', tag: '', work: false, offset: 0, total: 0, loading: false };
+    entriesState = { q: '', category: '', tag: '', work: false, offset: 0, total: 0, loading: false, seq: 0 };
     view.innerHTML =
       '<div class="page">' +
       '<header class="page-head entries-head"><h1>记录</h1>' +
@@ -1889,51 +2404,60 @@
     $('#f-clear').classList.toggle('hidden', !(s.q || s.category || s.work || s.tag));
   }
 
+  // A8-01：搜索与筛选过去走两个分支，搜索分支把 category/work/tag 全丢掉，
+  // 界面却照常渲染这些条件 chip。统一走 /api/entries —— 后端 list_entries_impl 的
+  // q 参数走 FTS 命中，且与 category/tag/work 是可叠加的 AND 条件，同时返回真实的 total，
+  // 于是「搜索 + 筛选」的结果与 chip 一致，分页也不再被硬截断在 100 条。
+  // A8-02：用请求序号取代「在途就丢弃」，后发的意图永远胜出，被抢占的响应直接丢弃。
+  // A8-03：await 前先捕获元素引用，切页后写入的是分离节点（无害），不再抛未捕获 TypeError。
   async function loadEntries(reset) {
     var s = entriesState;
-    if (!s || s.loading) return;
+    if (!s) return;
+    if (reset) s.offset = 0;
+    var seq = ++s.seq;
     s.loading = true;
-    if (reset) { s.offset = 0; $('#entries-list').innerHTML = loadingHtml(); }
-    renderActiveFilters();
+    var listEl = $('#entries-list');
     var moreBtn = $('#entries-more');
-    moreBtn.classList.add('hidden');
+    if (reset && listEl) listEl.innerHTML = loadingHtml();
+    renderActiveFilters();
+    if (moreBtn) moreBtn.classList.add('hidden');
+    var requestedOffset = s.offset;
+    var qs = '?limit=50&offset=' + requestedOffset;
+    if (s.q) qs += '&q=' + encodeURIComponent(s.q);
+    if (s.category) qs += '&category=' + encodeURIComponent(s.category);
+    if (s.work) qs += '&work=1';
+    if (s.tag) qs += '&tag=' + encodeURIComponent(s.tag);
     try {
-      var data;
-      if (s.q) {
-        data = await api('/api/search', { method: 'POST', body: { q: s.q, limit: 100 } });
-        s.total = data.items ? data.items.length : 0;
-        if (reset) $('#entries-list').innerHTML = '';
-        appendEntries(data.items || []);
-      } else {
-        var qs = '?limit=50&offset=' + s.offset;
-        if (s.category) qs += '&category=' + encodeURIComponent(s.category);
-        if (s.work) qs += '&work=1';
-        if (s.tag) qs += '&tag=' + encodeURIComponent(s.tag);
-        data = await api('/api/entries' + qs);
-        s.total = data.total || 0;
-        if (reset) $('#entries-list').innerHTML = '';
-        appendEntries(data.items || []);
-        s.offset += (data.items || []).length;
-        var shown = $('#entries-list').children.length;
-        if (shown < s.total) moreBtn.classList.remove('hidden');
-      }
-      if (!$('#entries-list').children.length) {
-        $('#entries-list').innerHTML = emptyHtml(
+      var data = await api('/api/entries' + qs);
+      if (seq !== s.seq) return; // 已被更新的筛选条件抢占：丢弃本次结果
+      s.total = data.total || 0;
+      // offset 按「本次请求的 offset」推导，避免叠加
+      s.offset = requestedOffset + ((data.items || []).length);
+      if (reset && listEl) listEl.innerHTML = '';
+      appendEntries(data.items || []);
+      if (listEl && !listEl.children.length) {
+        listEl.innerHTML = emptyHtml(
           s.q || s.category || s.work || s.tag ? '没有找到符合条件的记录' : '还没有任何记录',
           s.q || s.category || s.work || s.tag ? '换个关键词试试，或者清除条件' : '回到「今天」，写下第一句吧'
         );
       }
+      if (moreBtn && listEl && listEl.children.length && listEl.children.length < s.total) {
+        moreBtn.classList.remove('hidden');
+      }
     } catch (e) {
-      if (reset) $('#entries-list').innerHTML = errorHtml(e.message);
+      if (seq !== s.seq) return;
+      if (reset && listEl) listEl.innerHTML = errorHtml(e.message);
       else toast(e.message, 'error');
     } finally {
-      s.loading = false;
+      if (seq === s.seq) s.loading = false;
     }
   }
 
   function appendEntries(items) {
+    var el = $('#entries-list');
+    if (!el) return;
     var html = items.map(function (e) { return entryItemHtml(e, { showDate: true }); }).join('');
-    $('#entries-list').insertAdjacentHTML('beforeend', html);
+    el.insertAdjacentHTML('beforeend', html);
   }
 
   /* ================= 日历页 ================= */
@@ -1941,7 +2465,7 @@
 
   async function renderCalendar(view) {
     var now = new Date();
-    calState = { y: now.getFullYear(), m: now.getMonth() + 1, days: {}, selected: null };
+    calState = { y: now.getFullYear(), m: now.getMonth() + 1, days: {}, selected: null, seq: 0 };
     view.innerHTML =
       '<div class="page page-wide">' +
       '<header class="page-head"><h1>日历</h1><p class="page-sub">每一个有记录的日子，都在发光</p></header>' +
@@ -1975,13 +2499,19 @@
 
   async function loadMonth() {
     var grid = $('#cal-grid');
-    grid.innerHTML = loadingHtml();
+    if (grid) grid.innerHTML = loadingHtml();
+    // A8-12：把请求参数与渲染参数绑定。过去 await 回来读实时的 calState.y/m，
+    // 连点两次「下月」会让「10 月」的标题配上「9 月」的每日计数（数字全是错的月份）。
+    var y = calState.y, m = calState.m;
+    var seq = ++calState.seq;
     try {
-      var data = await api('/api/calendar?month=' + calState.y + '-' + pad(calState.m));
+      var data = await api('/api/calendar?month=' + y + '-' + pad(m));
+      if (seq !== calState.seq) return; // 已被更新的月份抢占
       calState.days = (data && data.days) || {};
       renderCalGrid();
     } catch (e) {
-      grid.innerHTML = errorHtml(e.message);
+      if (seq !== calState.seq) return;
+      if (grid) grid.innerHTML = errorHtml(e.message);
     }
   }
 
@@ -2012,17 +2542,28 @@
   async function selectDate(ds) {
     calState.selected = ds;
     renderCalGrid();
+    // A8-12：标题与内容都绑定本次点击的日期，快速点两天不再错配
+    var seq = ++calState.seq;
     var d = parseDate(ds + 'T00:00:00');
-    $('#cal-day-title').textContent = (d.getMonth() + 1) + ' 月 ' + d.getDate() + ' 日的记录';
+    var titleEl = $('#cal-day-title');
+    if (titleEl && d) titleEl.textContent = (d.getMonth() + 1) + ' 月 ' + d.getDate() + ' 日的记录';
     var box = $('#cal-list');
-    box.innerHTML = loadingHtml();
+    if (box) box.innerHTML = loadingHtml();
     try {
-      var data = await api('/api/entries?date=' + ds + '&limit=50&offset=0');
-      box.innerHTML = (data.items && data.items.length)
-        ? data.items.map(function (e) { return entryItemHtml(e); }).join('')
-        : emptyHtml('这一天还没有记录', '去「今天」补上几句吧');
+      // A8-05：单日 50 条截断改为按接口上限（200）取，并在超限时明确提示
+      var data = await api('/api/entries?date=' + encodeURIComponent(ds) + '&limit=200&offset=0');
+      if (seq !== calState.seq || !box) return;
+      var items = data.items || [];
+      if (items.length) {
+        box.innerHTML = items.map(function (e) { return entryItemHtml(e); }).join('') +
+          ((data.total || 0) > items.length
+            ? '<p class="hint center">这一天共有 ' + esc(data.total) + ' 条，这里显示前 ' + esc(items.length) + ' 条</p>'
+            : '');
+      } else {
+        box.innerHTML = emptyHtml('这一天还没有记录', '去「今天」补上几句吧');
+      }
     } catch (e) {
-      box.innerHTML = errorHtml(e.message);
+      if (seq === calState.seq && box) box.innerHTML = errorHtml(e.message);
     }
   }
 
@@ -2031,7 +2572,7 @@
   var MEDIA_KINDS = [ ['', '全部'], ['image', '图片'], ['video', '视频'], ['file', '文件'] ];
 
   async function renderMedia(view) {
-    mediaState = { kind: '', offset: 0, reachedEnd: false };
+    mediaState = { kind: '', offset: 0, reachedEnd: false, seq: 0 };
     view.innerHTML =
       '<div class="page page-wide">' +
       '<header class="page-head"><h1>媒体</h1><p class="page-sub">所有照片、视频与文件，都是成长的证据</p></header>' +
@@ -2062,31 +2603,47 @@
   async function loadMedia(reset) {
     var s = mediaState;
     if (!s) return;
+    // A8-03：await 前先捕获元素引用，切页后写入分离节点不会抛错
+    var grid = $('#media-grid');
+    var empty = $('#media-empty');
+    var moreBtn = $('#media-more');
     if (reset) {
       s.offset = 0; s.reachedEnd = false;
-      $('#media-grid').innerHTML = '';
-      $('#media-empty').innerHTML = loadingHtml();
+      if (grid) grid.innerHTML = '';
+      if (empty) empty.innerHTML = loadingHtml();
     }
-    $('#media-more').classList.add('hidden');
+    if (moreBtn) moreBtn.classList.add('hidden');
+    // A8-06：请求序号 + kind 快照。过去无并发守卫，快速切 tab 会让后返回的旧结果
+    // 追加进新 tab 的网格、并把 offset 重复累加（媒体列表静默漏项）。
+    var seq = ++s.seq;
+    var kind = s.kind;
+    var requestedOffset = s.offset;
     try {
-      var qs = '?limit=100&offset=' + s.offset;
-      if (s.kind) qs += '&kind=' + encodeURIComponent(s.kind);
+      var qs = '?limit=100&offset=' + requestedOffset;
+      if (kind) qs += '&kind=' + encodeURIComponent(kind);
       var data = await api('/api/assets' + qs);
+      if (seq !== s.seq || kind !== s.kind) return; // 已切到别的 tab / 有更新的请求
       var items = data.items || [];
-      s.offset += items.length;
+      // offset 按本次请求的 offset 推导，而不是就地累加
+      s.offset = requestedOffset + items.length;
       if (items.length < 100) s.reachedEnd = true;
-      $('#media-empty').innerHTML = '';
-      var grid = $('#media-grid');
-      grid.insertAdjacentHTML('beforeend', items.map(function (a) {
-        return attTileHtml(a, { entryId: a.entry_id });
-      }).join(''));
-      if (!grid.children.length) {
-        $('#media-empty').innerHTML = emptyHtml('这里还空着', '记录时添加照片、视频或文件，就会出现在这里');
+      if (empty) empty.innerHTML = '';
+      if (grid) {
+        grid.insertAdjacentHTML('beforeend', items.map(function (a) {
+          return attTileHtml(a, { entryId: a.entry_id });
+        }).join(''));
+      }
+      if (!grid || !grid.children.length) {
+        if (empty) empty.innerHTML = emptyHtml('这里还空着', '记录时添加照片、视频或文件，就会出现在这里');
       } else if (!s.reachedEnd) {
-        $('#media-more').classList.remove('hidden');
+        // A8-07：只有成功路径才恢复按钮——失败分支下面也会恢复
+        if (moreBtn) moreBtn.classList.remove('hidden');
       }
     } catch (e) {
-      $('#media-empty').innerHTML = errorHtml(e.message);
+      if (seq !== s.seq || kind !== s.kind) return;
+      if (empty) empty.innerHTML = errorHtml(e.message);
+      // A8-07：加载更多失败后按钮过去永久隐藏，用户只能切页重进；这里显式恢复
+      if (moreBtn && grid && grid.children.length) moreBtn.classList.remove('hidden');
     }
   }
 
@@ -2127,6 +2684,9 @@
         return;
       }
       box.innerHTML = data.items.map(function (r) {
+        // A8-16：<button> 不能作为 <a> 的后代（interactive content），各浏览器 DOM 修正
+        // 行为不一致；改用 span + role=button（复用小删除按钮的样式类），
+        // 不再依赖 preventDefault 兜底。
         return '<a class="rep-item" href="#/reports/' + encodeURIComponent(r.id) + '">' +
           '<span class="badge">' + esc(REP_TYPES[r.type] || r.type) + '</span>' +
           '<div class="rep-item-main">' +
@@ -2134,28 +2694,34 @@
           '<div class="rep-item-meta">生成于 ' + esc(absTime(r.created_at)) + ' · 覆盖 ' + esc(r.entry_count) + ' 条记录' +
           (r.model ? ' · ' + esc(r.model) : '') + '</div>' +
           '</div>' +
-          '<button class="quiet-del" data-del-rep="' + esc(r.id) + '" title="删除报告"><svg class="ic"><use href="#i-close"/></svg></button>' +
+          '<span class="quiet-del" role="button" tabindex="0" data-del-rep="' + esc(r.id) + '" title="删除报告" aria-label="删除报告"><svg class="ic"><use href="#i-close"/></svg></span>' +
           '</a>';
       }).join('');
       $$('#rep-list [data-del-rep]').forEach(function (btn) {
-        btn.onclick = async function (ev) {
+        var del = async function (ev) {
           ev.preventDefault();
           ev.stopPropagation();
           var ok = await confirmModal('删除后不可恢复，确定删除这份报告吗？', '删除');
           if (!ok) return;
-          btn.disabled = true;
+          var card = btn.closest('.rep-item');
+          btn.setAttribute('aria-disabled', 'true');
           try {
             await api('/api/reports/' + encodeURIComponent(btn.dataset.delRep), { method: 'DELETE' });
-            btn.closest('.rep-item').remove();
+            if (card) card.remove();
             toast('报告已删除', 'success');
-            if (!$('#rep-list').children.length) {
+            if ($('#rep-list') && !$('#rep-list').children.length) {
               $('#rep-list').innerHTML = emptyHtml('还没有生成过报告', '选一个日期，让 AI 为你总结吧');
             }
           } catch (e) {
             toast(e.message, 'error');
-            btn.disabled = false;
+            btn.removeAttribute('aria-disabled');
           }
         };
+        btn.onclick = del;
+        // span 不是原生按钮：补键盘可达性
+        btn.addEventListener('keydown', function (ev) {
+          if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); del(ev); }
+        });
       });
     } catch (e) {
       $('#rep-list').innerHTML = errorHtml(e.message);
@@ -2163,8 +2729,26 @@
   }
 
   /* ---- 年度故事卡：报告页低调入口 → 全屏卡片流 ---- */
-  var yrCache = { year: 0, cards: null };
+  var yrCache = { year: 0, cards: null, pending: null };
   var yrCards = [], yrIndex = 0, yrOverlay = null, yrKeyHandler = null;
+
+  // A8-13：过去缓存只在响应之后写入，在途期间每次重进报告页都会再发一次
+  // 180 秒超时的请求，而后端缓存缺失时会真的调用 AI 生成。用 pending promise
+  // 复用同一在途请求，避免叠加多次昂贵调用。
+  function fetchYearReview(year) {
+    if (yrCache.year === year && yrCache.cards) return Promise.resolve(yrCache.cards);
+    if (yrCache.year === year && yrCache.pending) return yrCache.pending;
+    var p = api('/api/year-review?year=' + year, { timeout: 180000 }).then(function (d) {
+      var cards = (d && d.cards) || [];
+      yrCache = { year: year, cards: cards, pending: null };
+      return cards;
+    }).catch(function (e) {
+      yrCache.pending = null;
+      throw e;
+    });
+    yrCache = { year: year, cards: null, pending: p };
+    return p;
+  }
 
   // 进报告页时安静探一次：有数据才显示入口卡（结果缓存，点开不重复请求）
   function probeYearReview() {
@@ -2172,9 +2756,7 @@
     var slot = $('#yr-slot');
     if (!slot) return;
     if (yrCache.year === year && yrCache.cards && yrCache.cards.length) { renderYrEntry(slot, year); return; }
-    api('/api/year-review?year=' + year, { timeout: 180000 }).then(function (d) {
-      var cards = (d && d.cards) || [];
-      yrCache = { year: year, cards: cards };
+    fetchYearReview(year).then(function (cards) {
       if (cards.length && document.body.contains(slot)) renderYrEntry(slot, year);
     }).catch(function () { /* 没有就安静不出 */ });
   }
@@ -2265,11 +2847,7 @@
 
     var ready = (yrCache.year === year && yrCache.cards)
       ? Promise.resolve(yrCache.cards)
-      : api('/api/year-review?year=' + year, { timeout: 180000 }).then(function (d) {
-          var cards = (d && d.cards) || [];
-          yrCache = { year: year, cards: cards };
-          return cards;
-        });
+      : fetchYearReview(year); // A8-13：复用同一在途请求
     ready.then(function (cards) {
       if (ov !== yrOverlay) return; // 已经关掉了
       yrCards = cards; yrIndex = 0;
@@ -2373,10 +2951,12 @@
     // 将 evidence 匹配到条目文本，生成可点击的小链条徽章
     function evBadges(text) {
       var out = '';
+      // A8-04 附带：模糊匹配加最小长度保护，避免 20 字以内的短句被误分配
+      var probe = text && text.length >= 8 ? text.slice(0, 20) : '';
       evidences.forEach(function (ev, i) {
         if (usedEv[i] || !ev || ev.entry_id == null) return;
         var claim = toText(ev.claim);
-        if (claim && text && (text.indexOf(claim) !== -1 || claim.indexOf(text.slice(0, 20)) !== -1)) {
+        if (claim && text && (text.indexOf(claim) !== -1 || (probe && claim.indexOf(probe) !== -1))) {
           usedEv[i] = true;
           out += '<a class="ev-badge" href="#/entry/' + encodeURIComponent(ev.entry_id) + '" title="' + esc(claim) + '">' +
             '<svg class="ic"><use href="#i-link"/></svg>证据</a>';
@@ -2393,7 +2973,9 @@
         }).join('') + '</ul></section>';
     }
 
-    var restEv = evidences.filter(function (ev, i) { return !usedEv[i] && ev && ev.entry_id != null; });
+    // A8-04：restEv 必须在 secList 之后计算——usedEv 是 secList→evBadges 写入的，
+    // 之前放在 html 组装前求值，导致它恒等于「全部证据」，同一条证据既内联成徽章
+    // 又原样出现在「相关证据」里，削弱了报告最核心的可核对证据链。
     var html =
       '<div class="page">' +
       '<div class="rep-detail-bar">' +
@@ -2428,6 +3010,8 @@
       secList('经验', a.learnings) +
       secList('建议', a.suggestions);
 
+    // A8-04：「相关证据」= 上面各节未引用到的剩余证据（此处才计算 usedEv 已就绪）
+    var restEv = evidences.filter(function (ev, i) { return !usedEv[i] && ev && ev.entry_id != null; });
     if (restEv.length) {
       html += '<section class="card rep-sec"><h2 class="card-title">相关证据</h2><ul class="rep-list">' +
         restEv.map(function (ev) {
@@ -2489,6 +3073,10 @@
   async function loadRiver() {
     var box = $('#river-box');
     if (!box) return;
+    var moreBtn = $('#river-more');
+    // A8-07：失败分支过去只把 box 换成错误文案，按钮状态不变——若此前是 hidden
+    // 就再也点不了，用户只能切页重进。先记录按钮当前可见性，出错时恢复。
+    var wasMoreVisible = moreBtn && !moreBtn.classList.contains('hidden');
     try {
       var data = await api('/api/river?limit=' + riverState.limit);
       var items = (data && data.items) || [];
@@ -2496,6 +3084,12 @@
         box.innerHTML = emptyHtml('长河还空着', '写下第一条记录，河流就开始了');
         return;
       }
+      // A8-09：整体重建会丢掉用户已展开的月份。重建前按月份名记下展开状态，重建后恢复。
+      var openLabels = {};
+      $$('#river-box details.river-month-group').forEach(function (d) {
+        var lbl = d.querySelector('.river-month');
+        if (lbl) openLabels[(lbl.textContent || '').replace(/\s+/g, ' ').split('·')[0].trim()] = d.open;
+      });
       // 按月分组（正序，月份大标题 + 条目小卡）
       var groups = [];
       var cur = null;
@@ -2506,14 +3100,22 @@
         cur.items.push(e);
       });
       box.innerHTML = groups.map(function (g, gi) {
-        return '<details class="river-month-group"' + (gi < 2 ? ' open' : '') + '>' +
+        // 已经展开过的月份保持展开；首次加载仍默认展开前两组
+        var isOpen = (g.label in openLabels) ? openLabels[g.label] : (gi < 2);
+        return '<details class="river-month-group"' + (isOpen ? ' open' : '') + '>' +
           '<summary class="river-month">' + esc(g.label) + '<span class="badge">' + esc(g.items.length) + ' 条</span></summary>' +
           '<div class="river-group">' + g.items.map(riverItemHtml).join('') + '</div></details>';
       }).join('');
       var more = $('#river-more');
       if (more) more.classList.toggle('hidden', items.length < riverState.limit);
     } catch (e) {
-      box.innerHTML = errorHtml(e.message);
+      // A8-07：保留已加载内容，把错误条插在下方，并确保「加载更多」仍可点
+      var errBar = document.createElement('p');
+      errBar.className = 'hint center';
+      errBar.textContent = '加载失败：' + (e.message || '请稍后重试');
+      if (box.querySelector('.river-month-group')) box.appendChild(errBar);
+      else box.innerHTML = errorHtml(e.message);
+      if (moreBtn && (wasMoreVisible || box.querySelector('.river-month-group'))) moreBtn.classList.remove('hidden');
     }
   }
 
@@ -2569,7 +3171,8 @@
       var moodT = pt.mood_avg != null ? Math.round(pt.mood_avg * 10) / 10 : '—';
       var moodL = pl.mood_avg != null ? Math.round(pl.mood_avg * 10) / 10 : '—';
       html += '<div class="card mb-20"><h2 class="card-title">' + esc(labelT) + ' vs ' + esc(labelL) + '</h2><div class="cmp-grid">' +
-        cmpRow('记录数', pt.entries || 0, (pl.entries != null ? pl.entries : '—') + ' 条') +
+        // A8-19：左右两侧单位统一（过去只有右侧「记录数」拼了「条」）
+        cmpRow('记录数', (pt.entries || 0) + ' 条', (pl.entries != null ? pl.entries : '—') + ' 条') +
         cmpRow('字数', fmtWords(pt.words || 0), fmtWords(pl.words || 0)) +
         cmpRow('心情均分', moodT, moodL) +
         cmpRow('最常标签', pt.top_tag ? '#' + pt.top_tag : '—', pl.top_tag ? '#' + pl.top_tag : '—') +
@@ -2672,10 +3275,11 @@
           try {
             await api('/api/insights/' + encodeURIComponent(btn.dataset.idismiss) + '/dismiss', { method: 'POST' });
             var card = btn.closest('.ins-card');
+            if (!card) return;
             card.style.opacity = '0';
             setTimeout(function () {
               card.remove();
-              if (!slot.querySelector('.ins-card')) slot.innerHTML = '';
+              if (slot && !slot.querySelector('.ins-card')) slot.innerHTML = '';
             }, 250);
           } catch (e) {
             toast(e.message, 'error');
@@ -2683,7 +3287,19 @@
           }
         };
       });
-    } catch (e) { /* 静默：端点不在或样本不足都不出 */ }
+    } catch (e) {
+      // A8-20：过去三种完全不同的情况（接口 404/500、统计异常、样本不足）在界面上
+      // 呈现为完全相同的空白，用户与维护者都无法区分「功能正常但没规律」与「接口坏了」。
+      // 404 仍静默（端点不存在的旧后端），其它错误给一行可读的说明 + 重试。
+      if (e && e.status === 404) return;
+      if (document.body.contains(slot)) {
+        slot.innerHTML = '<div class="card ins-card"><div class="ins-text">规律区暂时读不到：' +
+          esc(e.message || '请稍后再试') + '</div>' +
+          '<div class="ins-foot"><span></span><button class="link-btn" id="ins-retry">重试</button></div></div>';
+        var retry = $('#ins-retry');
+        if (retry) retry.onclick = function () { slot.innerHTML = ''; loadInsights(); };
+      }
+    }
   }
 
   function initCharts(s) {
@@ -2700,7 +3316,10 @@
         tooltip: {
           trigger: 'axis',
           formatter: function (ps) {
+            // A8-18：ps 为空数组时过去直接取 ps[0].dataIndex 会抛 TypeError
+            if (!ps || !ps.length) return '';
             var d = moodData[ps[0].dataIndex];
+            if (!d) return '';
             return d.date + ' · ' + (d.label || '') + ' · ' + d.score + ' 分';
           }
         },
@@ -2835,6 +3454,10 @@
 
   /* ================= 成长页 ================= */
   async function renderGrowth(view) {
+    // A8-17：experimentFilter 是模块级变量，过去路由切换从不清零。
+    // 上次停在「已结束」tab，切走再回来仍显示已结束 → 若为空态，
+    // 用户会以为进行中的实验丢了。每次进入成长页回到「进行中」。
+    experimentFilter = 'active';
     view.innerHTML =
       '<div class="page">' +
       '<header class="page-head"><h1>成长</h1><p class="page-sub">回头看看走了多远，再想想想去哪里</p></header>' +
@@ -2901,7 +3524,14 @@
             (e.summary ? '<span class="star-sub">' + esc(e.summary) + '</span>' : '') +
             '</span></a>';
         }).join('');
-    } catch (e) { /* 静默 */ }
+      // A8-05：星标超过 50 条时过去静默截断，明确告知
+      if ((data.total || 0) > items.length) {
+        wrap.innerHTML += '<p class="hint">共 ' + esc(data.total) + ' 条高光，这里显示最近 ' + esc(items.length) + ' 条</p>';
+      }
+    } catch (e) {
+      // A8-20：有信息量的失败不该降级为无信息的空
+      if (document.body.contains(wrap)) wrap.innerHTML = '<p class="hint">高光时刻暂时读不到：' + esc(e.message || '请稍后重试') + '</p>';
+    }
   }
 
   /* ---- 未来方向（AI 从记录里发现方向） ---- */
@@ -2970,6 +3600,12 @@
   }
 
   /* ---- 我的成长轨迹（总结现在） ---- */
+  // A8-11：过去只要「没有 summary」就每次进入成长页都自动发起一次昂贵的大模型调用。
+  // 后端持续失败时用户反复进出就会反复计费；这里加「在途守卫 + 失败冷却」。
+  var summaryInFlight = false;
+  var summaryLastAttemptAt = 0;
+  var SUMMARY_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+
   async function loadSummary() {
     var box = $('#summary-box');
     if (!box) return;
@@ -2989,15 +3625,19 @@
       var st = await api('/api/settings');
       aiReady = !!(st && st.has_ai_key && st.ai_base_url);
     } catch (e) { aiReady = false; }
-    if (aiReady) {
+    if (aiReady && !summaryInFlight && Date.now() - summaryLastAttemptAt > SUMMARY_RETRY_COOLDOWN_MS) {
       generateSummary();
     } else {
+      var regenBtn0 = $('#summary-regen');
+      if (regenBtn0) regenBtn0.classList.remove('hidden');
       box.innerHTML =
         '<div class="card summary-guide">' +
         '<svg class="empty-ic"><use href="#i-sprout"/></svg>' +
-        '<p class="empty-title">这里会讲出你一路走来的故事</p>' +
-        '<p class="empty-sub">配置好 AI 后，它会读你的记录，为你总结成长轨迹</p>' +
-        '<a class="btn btn-ghost" href="#/settings">去设置页配置 AI</a>' +
+        '<p class="empty-title">' + (aiReady ? '还没有成长总结' : '这里会讲出你一路走来的故事') + '</p>' +
+        '<p class="empty-sub">' + (aiReady
+          ? '刚试过生成但没成功，可以点右上角「重新总结」再试一次（避免反复自动请求）'
+          : '配置好 AI 后，它会读你的记录，为你总结成长轨迹') + '</p>' +
+        (aiReady ? '' : '<a class="btn btn-ghost" href="#/settings">去设置页配置 AI</a>') +
         '</div>';
     }
   }
@@ -3005,18 +3645,25 @@
   async function generateSummary() {
     var box = $('#summary-box');
     if (!box) return;
+    if (summaryInFlight) return; // A8-11：并发守卫
+    summaryInFlight = true;
+    summaryLastAttemptAt = Date.now();
     box.innerHTML = '<div class="loading"><div class="spinner"></div><p>AI 正在回顾你的记录…</p></div>';
     var regenBtn = $('#summary-regen');
     if (regenBtn) regenBtn.disabled = true;
     try {
       var data = await api('/api/growth/summary/generate', { method: 'POST', timeout: 600000 });
       renderSummary(data && data.summary);
-      toast('成长轨迹已更新', 'success');
+      // A8-11：离页后 toast 会飘在别的页面上；只有还在本页才提示
+      if (document.body.contains(box)) toast('成长轨迹已更新', 'success');
     } catch (e) {
       // 422 记录太少 / 502 AI 失败：展示后端 detail
-      box.innerHTML = emptyHtml('这次没能生成总结', e.message);
+      // A8-11：box 已脱离文档时写 innerHTML 用户完全看不到，退化为 toast
+      if (document.body.contains(box)) box.innerHTML = emptyHtml('这次没能生成总结', e.message);
+      else toast('这次没能生成成长总结：' + e.message, 'error', 6000);
       if (regenBtn) regenBtn.classList.remove('hidden');
     } finally {
+      summaryInFlight = false;
       if (regenBtn) regenBtn.disabled = false;
     }
   }
@@ -3321,6 +3968,10 @@
 
   function renderForecast(forecast, notice) {
     var box = $('#forecast-box');
+    // A8-10：本段其它加载函数都有 `if (!box) return;`，只有这里漏了。
+    // generateForecast 的 POST 超时是 600s，期间切页是常规操作，随后 422 分支
+    // 会在 catch 块内抛未捕获 TypeError（→ unhandled rejection）。
+    if (!box) return;
     if (!forecast) {
       box.innerHTML = emptyHtml(
         notice || '还没有推演结果',
@@ -3711,6 +4362,22 @@
 
   /* ================= 设置页 ================= */
   /* ---- 复制到剪贴板（带降级） ---- */
+  // A9-03：「兼容配置」表单的差分提交基线（本页快照），激活供应商后随之刷新
+  var legacyAiBaseline = null;
+  function legacyAiFormState() {
+    return {
+      ai_base_url: ($('#s-base') && $('#s-base').value) ? $('#s-base').value.trim() : '',
+      ai_model: ($('#s-model') && $('#s-model').value) ? $('#s-model').value.trim() : '',
+      ai_vision: !!($('#s-vision') && $('#s-vision').checked),
+      ai_effort: ($('#s-effort') && $('#s-effort').value) || 'auto',
+      ai_fast_base_url: ($('#s-fbase') && $('#s-fbase').value) ? $('#s-fbase').value.trim() : '',
+      ai_fast_model: ($('#s-fmodel') && $('#s-fmodel').value) ? $('#s-fmodel').value.trim() : '',
+      ai_fast_effort: ($('#s-feffort') && $('#s-feffort').value) || 'auto',
+      embed_base_url: ($('#s-ebase') && $('#s-ebase').value) ? $('#s-ebase').value.trim() : '',
+      embed_model: ($('#s-emodel') && $('#s-emodel').value) ? $('#s-emodel').value.trim() : ''
+    };
+  }
+
   async function copyText(val) {
     try {
       await navigator.clipboard.writeText(val);
@@ -3720,14 +4387,20 @@
       ta.value = val;
       document.body.appendChild(ta);
       ta.select();
-      try { document.execCommand('copy'); toast('已复制', 'success'); }
-      catch (e2) { toast('复制失败，请手动选择复制', 'error'); }
+      // A9-33(2)：execCommand 失败时返回 false 而不抛异常；局域网 http 下
+      // navigator.clipboard 不可用，走的正是这条降级路径，必须检查返回值，
+      // 否则用户拿到「已复制」提示但剪贴板是空的。
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e2) { ok = false; }
       ta.remove();
+      if (ok) toast('已复制', 'success');
+      else toast('复制失败，请手动选择复制', 'error');
     }
   }
 
-  /* ---- 生成二维码 SVG（qrcode.js 缺失则返回空串） ---- */
+  /* ---- 生成二维码 SVG（qrcode.js 缺失或生成失败则返回空串） ---- */
   function makeQrSvg(text) {
+    // A9-33(3)：区分「库缺失/生成失败」与「没有地址」，调用方好给出对应提示
     if (typeof window.qrcode !== 'function') return '';
     try {
       var qr = window.qrcode(0, 'M');
@@ -3752,8 +4425,12 @@
     }
     try { si = await api('/api/server-info'); } catch (e) { si = null; }
     var phoneUrl = si && si.url ? si.url : '';
+    // A9-19：过去用子串匹配过滤（'192.168.1.1' 是 '192.168.1.10' 的子串），
+    // 会误把可用地址排除或留下重复；从 phoneUrl 里取出主机名后严格比较。
+    var primaryHost = '';
+    try { primaryHost = phoneUrl ? new URL(phoneUrl).hostname : ''; } catch (e) { primaryHost = ''; }
     var otherIps = si && Array.isArray(si.ips)
-      ? si.ips.filter(function (ip) { return phoneUrl.indexOf(ip) === -1; })
+      ? si.ips.filter(function (ip) { return String(ip) !== primaryHost; })
       : [];
     var phoneCardInner;
     if (phoneUrl) {
@@ -3761,9 +4438,11 @@
       phoneCardInner =
         '<div class="phone-url-row"><code class="phone-url" id="phone-url" title="点击复制">' + esc(phoneUrl) + '</code>' +
         '<button class="btn btn-ghost btn-sm" id="phone-copy">复制</button></div>' +
-        (qrSvg ? '<div class="qr-box">' + qrSvg + '</div>' : '') +
+        // A9-33(3)：生成失败时给一行说明，别让用户以为「没检测到地址」
+        (qrSvg ? '<div class="qr-box">' + qrSvg + '</div>'
+               : '<p class="hint">二维码暂时生成失败，请手动在手机浏览器输入上面的地址</p>') +
         (otherIps.length
-          ? '<p class="hint">其他可用地址：' + otherIps.map(function (ip) {
+          ? '<p class="hint">其他可用地址（当前地址打不开时试试）：' + otherIps.map(function (ip) {
               return 'http://' + esc(ip) + ':' + esc(si.port);
             }).join('　') + '</p>'
           : '') +
@@ -3875,8 +4554,14 @@
 
       '<div class="card">' +
       '<h2 class="card-title">Agent 令牌</h2>' +
+      // A9-07 / A2-02：过去把 st.agent_token 明文渲染进 value（并支持一键复制），
+      // 而该令牌是 /api/agent/* 的唯一凭证、且 /api/agent/ 还豁免访问口令锁——
+      // 等于「上了锁」的安全性完全等同于这个明文字符串的保密性。
+      // 现在对齐 has_agent_token 契约：只显示「已配置 / 未配置」，明文绝不进 DOM。
       '<div class="set-row"><label>访问令牌（给其他 AI 工具调用本系统时使用）</label>' +
-      '<div class="token-row"><input class="input" id="s-token" readonly value="' + esc(st.agent_token || '') + '">' +
+      '<p class="hint m-0" id="s-token-state">当前状态：' + (st.has_agent_token ? '已配置' : '未配置') + '</p>' +
+      '<p class="hint m-0">出于安全考虑，令牌不再回显；如需更换请点「重新生成」，新令牌会显示一次。</p>' +
+      '<div class="token-row hidden" id="s-token-row"><input class="input" id="s-token" readonly value="">' +
       '<button class="btn btn-ghost" id="s-copy">复制</button></div></div>' +
       '<div class="set-inline"><button class="btn btn-ghost" id="s-regen">重新生成</button></div>' +
       '<ul class="api-list">可调用接口：<li><code>/api/agent/entries</code></li><li><code>/api/agent/digest</code></li><li><code>/api/agent/search</code></li><li><code>/api/agent/reports/latest</code></li><li><code>/api/agent/metrics</code></li></ul>' +
@@ -3896,7 +4581,7 @@
       '<div class="card">' +
       '<h2 class="card-title">数据</h2>' +
       '<div class="set-row"><button class="btn btn-ghost" id="s-backup"><svg class="ic"><use href="#i-dl"/></svg>下载完整备份</button></div>' +
-      '<div class="set-row"><div class="set-inline"><button class="btn btn-ghost" id="s-verify-backup">验证最近一次备份</button></div>' +
+      '<div class="set-row"><div class="set-inline"><button class="btn btn-ghost" id="s-verify-backup">验证最近一次自动备份</button></div>' +
       '<p class="hint hidden" id="s-verify-result"></p></div>' +
       '<div class="set-row"><label>导出 Markdown（选择起止日期）</label>' +
       '<div class="set-inline">' +
@@ -3906,6 +4591,7 @@
       '</div></div>' +
       '<h2 class="card-title mt-20">自动备份</h2>' +
       '<div class="set-row"><label>备份目录</label><input class="input" id="s-backup-dir" placeholder="留空则存到应用目录 backups" value="' + esc(st.backup_dir || '') + '"></div>' +
+      '<p class="hint hidden" id="s-backup-dir-hint"></p>' +
       '<p class="hint">上次自动备份：' + (st.last_backup_at ? esc(absTime(st.last_backup_at)) : '还没有过') + '</p>' +
       '<div class="set-row"><label class="check-row"><input type="checkbox" id="s-auto-report"' + (st.auto_report_enabled ? ' checked' : '') + '> 周日晚自动生成周报、每月1号生成月报</label></div>' +
       '<div class="set-inline"><button class="btn btn-ghost" id="s-save-auto">保存</button></div>' +
@@ -3930,7 +4616,7 @@
       '<div class="card">' +
       '<h2 class="card-title">关于</h2>' +
       '<p class="hint mt-0">小满 · 成长证据库 v1.5 · 数据都保存在这台电脑上</p>' +
-      '<p class="hint">手机与电脑连同一 Wi-Fi 后，访问 ' + esc(phoneUrl || ('http://' + location.hostname + ':' + (location.port || '52122'))) + ' 即可使用</p>' +
+      '<p class="hint">手机与电脑连同一 Wi-Fi 后，访问 ' + esc(phoneUrl || ('http://' + location.hostname + ':' + (location.port || '52120'))) + ' 即可使用</p>' +
       '<p class="hint">小得盈满，日进一步。</p>' +
       '<p class="hint">每一步都算数。</p>' +
       '</div>';
@@ -3980,6 +4666,9 @@
             entries.forEach(function (entry) { if (entry.isIntersecting) { $$('.settings-nav button', nav).forEach(function (b) { b.classList.toggle('active', b.dataset.target === entry.target.id); }); } });
           }, { rootMargin: '-12% 0px -70% 0px', threshold: 0 });
           sections.forEach(function (section) { io.observe(section); });
+          // A9-08：observer 对被观察元素持强引用，不 disconnect 则每进一次设置页
+          // 就泄漏一整棵设置页 DOM（设置是底部 tabbar 里切得最频繁的一页）。
+          onPageCleanup(function () { try { io.disconnect(); } catch (e) { /* 忽略 */ } });
         }
       }
     }
@@ -4006,29 +4695,73 @@
       function render(items) {
         var slotNames = { strong: '大模型', fast: '小模型', embed: '嵌入模型' };
         list.innerHTML = items && items.length ? items.map(function (p) {
+          // A9-23：展示 has_key，让「未填 Key」与「已填但不回显」可区分
+          var keyState = p.has_key ? 'Key 已配置' : 'Key 未配置';
+          var enabledState = p.enabled === false ? ' · 已停用' : '';
           return '<div class="provider-item' + (p.is_active ? ' active' : '') + '">' +
             '<div class="provider-main"><div class="provider-name">' + esc(p.name || p.model || '未命名供应商') + (p.is_active ? ' · 当前使用' : '') + '</div>' +
-            '<div class="provider-meta">' + esc(slotNames[p.slot] || p.slot || '') + ' · ' + esc(p.model || '') + ' · ' + esc(p.base_url || '') + '</div></div>' +
+            '<div class="provider-meta">' + esc(slotNames[p.slot] || p.slot || '') + ' · ' + esc(p.model || '') + ' · ' + esc(p.base_url || '') + '</div>' +
+            '<div class="provider-meta">' + esc(keyState) + esc(enabledState) + '</div></div>' +
             '<div class="provider-actions">' + (!p.is_active ? '<button class="btn btn-ghost btn-sm" data-provider-act="' + esc(p.id) + '">启用</button>' : '') +
             '<button class="btn btn-ghost btn-sm" data-provider-test="' + esc(p.id) + '">测试</button><button class="btn btn-ghost btn-sm" data-provider-edit="' + esc(p.id) + '">编辑</button><button class="btn btn-ghost btn-sm" data-provider-del="' + esc(p.id) + '">删除</button></div></div>';
         }).join('') : '<div class="provider-empty">还没有保存的供应商，可继续使用下方快速配置。</div>';
       }
       var items = [];
-      try { var data = await api('/api/settings/ai-providers'); items = data.items || []; render(items); } catch (e) { list.innerHTML = '<div class="provider-empty">供应商管理将在后端更新后启用；当前仍可使用下方配置。</div>'; return; }
+      try { var data = await api('/api/settings/ai-providers'); items = data.items || []; render(items); } catch (e) {
+        // A9-24：列表降级的同时必须禁用工具栏按钮，否则「新增供应商」可见可点却毫无响应
+        list.innerHTML = '<div class="provider-empty">供应商管理将在后端更新后启用；当前仍可使用下方配置。</div>';
+        var addBtn0 = $('#s-provider-add');
+        if (addBtn0) { addBtn0.disabled = true; addBtn0.title = '当前后端版本不支持供应商管理'; }
+        return;
+      }
       function updateProviderFields() {
         var slot = $('#s-provider-slot').value;
         $('#s-provider-vision-row').classList.toggle('hidden', slot !== 'strong');
         $('#s-provider-effort-row').classList.toggle('hidden', slot === 'embed');
+        // A9-23：Key 框 placeholder 体现当前状态
+        var keyInput = $('#s-provider-key');
+        var hint = $('#s-provider-key-hint');
+        if (keyInput) {
+          keyInput.placeholder = editing
+            ? (editing.has_key ? '已配置，留空表示不修改' : '尚未配置，请填写')
+            : '新增时填写';
+        }
+        if (hint) hint.textContent = editing && editing.has_key ? '已配置（不会回显）' : '仅保存后端，不会回显';
       }
       function clearForm() { editing = null; form.classList.add('hidden'); ['name','base','model','key'].forEach(function (x) { $('#s-provider-' + x).value = ''; }); $('#s-provider-slot').value = 'strong'; $('#s-provider-effort').value = 'auto'; $('#s-provider-vision').checked = false; $('#s-provider-result').textContent = ''; updateProviderFields(); }
+      // A9-03：把「兼容配置」表单按服务端最新状态整体重填（含 #s-vision 与全部 slot）。
+      // 过去激活后只回填被激活 slot 的部分字段、漏掉 ai_vision、也不刷新其它 slot，
+      // 于是随后点「保存 AI 设置」会把陈旧值一起写回激活供应商行；
+      // 若 embed 的 base_url/model 因陈旧而被判为「有变化」，后端会清空全部向量
+      // （DELETE FROM entry_embeddings），而用户只看到一句「语义索引正在重建」。
+      function refreshLegacyForm(activeSt) {
+        if (!activeSt) return;
+        if ($('#s-base')) $('#s-base').value = activeSt.ai_base_url || '';
+        if ($('#s-model')) $('#s-model').value = activeSt.ai_model || '';
+        if ($('#s-effort')) $('#s-effort').value = activeSt.ai_effort || 'auto';
+        if ($('#s-vision')) $('#s-vision').checked = !!activeSt.ai_vision;   // ← 过去漏掉的字段
+        if ($('#s-fbase')) $('#s-fbase').value = activeSt.ai_fast_base_url || '';
+        if ($('#s-fmodel')) $('#s-fmodel').value = activeSt.ai_fast_model || '';
+        if ($('#s-feffort')) $('#s-feffort').value = activeSt.ai_fast_effort || 'auto';
+        if ($('#s-ebase')) $('#s-ebase').value = activeSt.embed_base_url || '';
+        if ($('#s-emodel')) $('#s-emodel').value = activeSt.embed_model || '';
+        // 重填后同步差分基线，避免把「刚被激活同步过来的值」误判为用户改动
+        legacyAiBaseline = legacyAiFormState();
+      }
       $('#s-provider-slot').onchange = updateProviderFields;
-      $('#s-provider-add').onclick = function () { editing = null; form.classList.remove('hidden'); updateProviderFields(); $('#s-provider-name').focus(); };
+      // A9-05：过去只清 editing、不清表单，编辑态下点「新增」会用上一条的输入
+      // （含 Key）创建一条重复供应商。改为先 clearForm() 再展开。
+      $('#s-provider-add').onclick = function () { clearForm(); form.classList.remove('hidden'); updateProviderFields(); $('#s-provider-name').focus(); };
       $('#s-provider-cancel').onclick = clearForm;
       $('#s-provider-test').onclick = async function () {
         var btn = this, result = $('#s-provider-result');
         var body = { name: $('#s-provider-name').value.trim(), slot: $('#s-provider-slot').value, base_url: $('#s-provider-base').value.trim(), model: $('#s-provider-model').value.trim(), vision: $('#s-provider-vision').checked, effort: $('#s-provider-effort').value, key: $('#s-provider-key').value.trim() };
         if (editing && !body.key) body.provider_id = editing.id;
-        if (!body.base_url || !body.model || (!body.key && !body.provider_id)) { toast('测试连接前请填写接口地址、模型名和 API Key', 'error'); return; }
+        // A9-33(5)：编辑态允许留空 Key，提示文案要与之相符
+        if (!body.base_url || !body.model || (!body.key && !body.provider_id)) {
+          toast(editing ? '测试连接前请填写接口地址与模型名（Key 留空则用已保存的）' : '测试连接前请填写接口地址、模型名和 API Key', 'error');
+          return;
+        }
         btn.disabled = true; result.className = 'test-inline'; result.textContent = '正在测试…';
         try { var tr = await api('/api/settings/ai-providers/test', { method: 'POST', body: body, timeout: 60000 }); result.className = 'test-inline ' + (tr.ok ? 'ok' : 'fail'); result.textContent = tr.message || (tr.ok ? '连接成功' : '连接失败'); } catch (err) { result.className = 'test-inline fail'; result.textContent = err.message; } finally { btn.disabled = false; }
       };
@@ -4038,13 +4771,9 @@
         try {
           if (e.target.dataset.providerAct) {
             await api('/api/settings/ai-providers/' + encodeURIComponent(id) + '/activate', { method: 'POST' });
-            // 激活会同步旧版 ai_* 设置，立即刷新下方兼容表单，避免用户看到旧模型名
-            try {
-              var activeSt = await api('/api/settings');
-              if (p && p.slot === 'strong') { $('#s-base').value = activeSt.ai_base_url || ''; $('#s-model').value = activeSt.ai_model || ''; $('#s-effort').value = activeSt.ai_effort || 'auto'; }
-              if (p && p.slot === 'fast') { $('#s-fbase').value = activeSt.ai_fast_base_url || ''; $('#s-fmodel').value = activeSt.ai_fast_model || ''; $('#s-feffort').value = activeSt.ai_fast_effort || 'auto'; }
-              if (p && p.slot === 'embed') { $('#s-ebase').value = activeSt.embed_base_url || ''; $('#s-emodel').value = activeSt.embed_model || ''; }
-            } catch (_) { /* 刷新失败不影响已完成的激活 */ }
+            // A9-03：激活会同步旧版 ai_* 设置 → 全量重取并重填兼容表单，
+            // 避免随后「保存 AI 设置」把陈旧快照写回（最坏误清语义索引）
+            try { refreshLegacyForm(await api('/api/settings')); } catch (_) { /* 刷新失败不影响已完成的激活 */ }
             toast('已启用供应商', 'success');
           }
           else if (e.target.dataset.providerTest) { var tr = await api('/api/settings/ai-providers/' + encodeURIComponent(id) + '/test', { method: 'POST', timeout: 60000 }); toast(tr.message || (tr.ok ? '连接成功' : '连接失败'), tr.ok ? 'success' : 'error', 5000); return; }
@@ -4057,7 +4786,14 @@
         var body = { name: $('#s-provider-name').value.trim(), slot: $('#s-provider-slot').value, base_url: $('#s-provider-base').value.trim(), model: $('#s-provider-model').value.trim(), vision: $('#s-provider-vision').checked, effort: $('#s-provider-effort').value };
         var key = $('#s-provider-key').value.trim(); if (key) body.key = key;
         if (!body.name || !body.base_url || !body.model) { toast('请填写名称、接口地址和模型名', 'error'); return; }
-        try { await api('/api/settings/ai-providers' + (editing ? '/' + encodeURIComponent(editing.id) : ''), { method: editing ? 'PATCH' : 'POST', body: body }); toast('供应商已保存', 'success'); clearForm(); var fresh = await api('/api/settings/ai-providers'); items = fresh.items || []; render(items); } catch (err) { toast(err.message, 'error'); }
+        // A9-05：编辑态下若 Key 留空且该供应商尚无 Key，提醒一句（避免「以为改了其实没填」）
+        if (editing && !key && !editing.has_key && !await confirmModal('这条供应商还没有 API Key，保存后仍不可用。继续保存吗？', '继续保存')) return;
+        try {
+          await api('/api/settings/ai-providers' + (editing ? '/' + encodeURIComponent(editing.id) : ''), { method: editing ? 'PATCH' : 'POST', body: body });
+          toast('供应商已保存', 'success'); clearForm();
+          var fresh = await api('/api/settings/ai-providers'); items = fresh.items || []; render(items);
+          try { refreshLegacyForm(await api('/api/settings')); } catch (_) { /* 忽略 */ }
+        } catch (err) { toast(err.message, 'error'); }
       };
     })();
     // 日志模板编辑
@@ -4095,29 +4831,48 @@
       } catch (e) { toast(e.message, 'error'); }
     };
     // AI 接口
+    // A9-03：改为差分提交——只发送相对本页快照真正变化的文本字段。
+    // 过去无条件提交三个 slot 的全部字段 + ai_vision，只要用户点一次
+    // 「保存 AI 设置」，后端 _sync_legacy_ai_edits 就会用 KV 值整体覆盖当前激活
+    // 供应商行；若 embed 字段因陈旧而被判为「有变化」，还会执行
+    // DELETE FROM entry_embeddings 清空整库语义索引，而用户毫不知情。
+    // 基线在此刻（表单刚渲染完）确立；激活供应商后由 refreshLegacyForm 同步刷新。
+    legacyAiBaseline = legacyAiFormState();
     $('#s-save-ai').onclick = async function () {
-      var body = {
-        ai_base_url: $('#s-base').value.trim(),
-        ai_model: $('#s-model').value.trim(),
-        ai_vision: $('#s-vision').checked,
-        ai_effort: $('#s-effort').value,
-        ai_fast_base_url: $('#s-fbase').value.trim(),
-        ai_fast_model: $('#s-fmodel').value.trim(),
-        ai_fast_effort: $('#s-feffort').value,
-        embed_base_url: $('#s-ebase').value.trim(),
-        embed_model: $('#s-emodel').value.trim()
-      };
+      var cur = legacyAiFormState();
+      // 基线可能因「激活供应商」的重填而刷新过；若尚未初始化则视为整体快照
+      if (!legacyAiBaseline) legacyAiBaseline = cur;
+      var body = {};
+      Object.keys(cur).forEach(function (k) {
+        if (cur[k] !== legacyAiBaseline[k]) body[k] = cur[k];
+      });
       var key = $('#s-key').value.trim();
       if (key) body.ai_key = key;
       var fkey = $('#s-fkey').value.trim();
       if (fkey) body.ai_fast_key = fkey;
       var ekey = $('#s-ekey').value.trim();
       if (ekey) body.embed_key = ekey;
+      if (!Object.keys(body).length) {
+        toast('没有需要保存的改动', 'info');
+        return;
+      }
+      // 会清空向量库的高风险写入：先让用户确认，并明确告知后果与原因
+      var embedChanging = ('embed_model' in body) || ('embed_base_url' in body);
+      if (embedChanging) {
+        var ok = await confirmModal(
+          '嵌入模型/接口发生了改动。新旧向量空间不兼容，保存后旧语义索引会被清空并重建。确定继续吗？',
+          '确认保存'
+        );
+        if (!ok) return;
+      }
       try {
         var saved = await api('/api/settings', { method: 'PUT', body: body });
+        legacyAiBaseline = cur;
         toast('AI 设置已保存', 'success');
         if (saved && saved.embed_rebuilt) {
-          setTimeout(function () { toast('嵌入模型已更换，语义索引正在后台自动重建', 'success', 5000); }, 600);
+          setTimeout(function () {
+            toast('嵌入模型已更换：' + (body.embed_model || body.embed_base_url) + '，已清空旧向量，正在后台重建', 'success', 6000);
+          }, 600);
         }
         $('#s-key').value = '';
         $('#s-fkey').value = '';
@@ -4184,6 +4939,25 @@
       btn.textContent = '批量补全历史记录的标题 / 摘要';
     };
     // 天气
+    // A9-31：同一页里圈子四个开关是「即改即存」，天气开关却只在点保存时生效；
+    // 用户勾完直接离开就静默丢弃。这里让两个布尔开关与圈子保持一致（即改即存 + 失败回滚），
+    // 「保存」按钮继续负责默认城市与高德 Key 这两个文本字段。
+    ['s-weather-enabled', 's-city-only'].forEach(function (id) {
+      var el = $('#' + id);
+      if (!el) return;
+      el.onchange = async function () {
+        var on = this.checked;
+        var body = {};
+        body[id === 's-weather-enabled' ? 'weather_enabled' : 'weather_city_only'] = on;
+        try {
+          await api('/api/settings', { method: 'PUT', body: body });
+          toast('已保存', 'success');
+        } catch (e) {
+          toast(e.message, 'error');
+          this.checked = !on;
+        }
+      };
+    });
     $('#s-save-weather').onclick = async function () {
       var body = {
         default_city: $('#s-city').value.trim(),
@@ -4198,19 +4972,31 @@
         $('#s-amap').value = '';
       } catch (e) { toast(e.message, 'error'); }
     };
-    // Agent
-    $('#s-copy').onclick = function () { copyText($('#s-token').value); };
+    // Agent（A9-07：令牌只写不读，明文仅在「重新生成」当次响应里显示一次）
+    var copyTokenBtn = $('#s-copy');
+    if (copyTokenBtn) copyTokenBtn.onclick = function () {
+      var el = $('#s-token');
+      if (el && el.value) copyText(el.value);
+      else toast('令牌不回显，请点「重新生成」获取新令牌', 'info');
+    };
     $('#s-regen').onclick = async function () {
       var ok = await confirmModal('重新生成后，旧令牌将立即失效，确定吗？', '重新生成');
       if (!ok) return;
       try {
         var r = await api('/api/settings', { method: 'PUT', body: { regenerate_agent_token: true } });
-        if (r && r.agent_token) $('#s-token').value = r.agent_token;
-        else {
-          var st2 = await api('/api/settings');
-          $('#s-token').value = st2.agent_token || '';
+        var fresh = r && typeof r.agent_token === 'string' ? r.agent_token : '';
+        if (!fresh) {
+          // 后端已改为不回明文：只更新状态文案
+          var stateEl = $('#s-token-state');
+          if (stateEl) stateEl.textContent = '当前状态：已配置';
+          toast('已生成新令牌。若需查看，请到服务端日志或后端接口获取', 'success', 6000);
+          return;
         }
-        toast('已生成新令牌', 'success');
+        $('#s-token').value = fresh;
+        $('#s-token-row').classList.remove('hidden');
+        var stateEl2 = $('#s-token-state');
+        if (stateEl2) stateEl2.textContent = '当前状态：已配置（新令牌仅显示这一次，请立即复制保存）';
+        toast('已生成新令牌，请立即复制保存（离开本页后不再显示）', 'success', 8000);
       } catch (e) { toast(e.message, 'error'); }
     };
     // 每日回顾推送
@@ -4242,25 +5028,58 @@
     // 自动备份 / 自动化
     $('#s-save-auto').onclick = async function () {
       try {
-        await api('/api/settings', {
+        var r = await api('/api/settings', {
           method: 'PUT',
           body: {
             backup_dir: $('#s-backup-dir').value.trim(),
             auto_report_enabled: $('#s-auto-report').checked
           }
         });
-        toast('已保存', 'success');
+        // A9-13：后端在目录不可写时会静默回退到默认目录，过去前端仍显示用户填的路径，
+        // 造成「配置显示 X、实际写在 Y」。以后端回传的生效目录为准并明确告知。
+        var asked = $('#s-backup-dir').value.trim();
+        var effective = r && (r.backup_dir_effective || r.backup_dir);
+        if (asked && effective && effective !== asked) {
+          toast('已保存。注意：该目录不可写，实际备份会落在 ' + effective, 'error', 8000);
+          var dirHint = $('#s-backup-dir-hint');
+          if (dirHint) {
+            dirHint.textContent = '实际生效目录：' + effective + '（你填写的目录不可写）';
+            dirHint.classList.remove('hidden');
+          }
+        } else {
+          toast('已保存', 'success');
+        }
       } catch (e) { toast(e.message, 'error'); }
     };
     // 访问口令
     $('#s-save-lock').onclick = async function () {
-      var v = $('#s-access-key').value.trim();
+      var input = $('#s-access-key');
+      var v = input.value.trim();
       if (!v) { toast('先输入一个口令；想取消口令请点「关闭口令」', 'error'); return; }
+      var btn = this;
+      if (btn) btn.disabled = true;
       try {
         await api('/api/settings', { method: 'PUT', body: { access_key: v } });
-        toast('口令已设置，下次访问需要输入', 'success');
+        // A9-22：与其它密钥输入框一致，成功后立即清空明文
+        input.value = '';
+        // A9-06：设置口令后中间件立刻生效，而 xm_auth cookie 只在 /api/auth 下发，
+        // 于是用户刚设完口令就被自己设的锁屏挡住。这里先自助登录一次，
+        // 拿到解锁会话再重渲染，让行为与「下次访问需要输入」的文案一致。
+        var unlocked = false;
+        try {
+          var res = await fetch('/api/auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: v })
+          });
+          unlocked = res.ok;
+        } catch (e2) { unlocked = false; }
+        toast(unlocked
+          ? '口令已设置，本机已自动解锁；其他设备访问需要输入口令'
+          : '口令已设置，下次访问需要输入（本机可能需重新输入一次）', 'success', 6000);
         route();
       } catch (e) { toast(e.message, 'error'); }
+      finally { if (btn) btn.disabled = false; }
     };
     var clearBtn = $('#s-clear-lock');
     if (clearBtn) clearBtn.onclick = async function () {
@@ -4332,14 +5151,24 @@
       out.classList.add('hidden');
       try {
         var r = await api('/api/backup/verify', { timeout: 60000 });
-        out.textContent = (r && r.ok ? '✓ ' : '✗ ') + ((r && r.detail) || (r && r.ok ? '备份完整可恢复' : '验证没通过，建议重新备份一次'));
+        // A9-12：文案明说只验自动备份；并展示后端已返回的 backup_name/age_hours/size_mb，
+        // 让「最近一次」可核对（过去这些诊断字段被直接丢弃）
+        var bits = [(r && r.ok ? '✓ ' : '✗ ') + ((r && r.detail) || (r && r.ok ? '备份完整可恢复' : '验证没通过，建议重新备份一次'))];
+        if (r && r.backup_name) {
+          var meta = '文件：' + r.backup_name;
+          if (r.age_hours != null) meta += ' · ' + r.age_hours + ' 小时前';
+          if (r.size_mb != null) meta += ' · ' + r.size_mb + ' MB';
+          bits.push(meta);
+        }
+        bits.push('（本项只验证自动备份目录里的 backup-*.zip；手动下载的备份是临时文件，不在其中）');
+        out.textContent = bits.join(' ');
         out.classList.remove('hidden');
       } catch (e) {
         out.textContent = '✗ ' + e.message;
         out.classList.remove('hidden');
       }
       btn.disabled = false;
-      btn.textContent = '验证最近一次备份';
+      btn.textContent = '验证最近一次自动备份';
     };
     $('#s-export-md').onclick = async function () {
       var from = $('#s-exp-from').value, to = $('#s-exp-to').value;
@@ -4390,7 +5219,9 @@
             await api('/api/entries/' + encodeURIComponent(row.dataset.tid) + '/restore', { method: 'POST' });
             row.remove();
             toast('已恢复', 'success');
-            if (!$('#trash-box').children.length) loadTrash();
+            // A9-17：导航离开后 #trash-box 可能已不存在，过去 null.children 抛未捕获 TypeError
+            var box2 = $('#trash-box');
+            if (box2 && !box2.children.length) loadTrash();
           } catch (e) {
             toast(e.message, 'error');
             btn.disabled = false;
@@ -4404,16 +5235,28 @@
 
   /* ================= 记录详情 / 编辑页 ================= */
   var currentEntry = null;
+  // A9-04：渲染/异步回调限定在「入口时的 entry id」，不依赖全局 currentEntry 覆盖。
+  // 上传期间切到另一条记录时，迟到的响应不会再画进新页面。
+  var entryPageId = null;
+  var entryWorkConfirmed = false; // A9-30：本次进入详情页是否已确认过「人工定论」
 
   async function renderEntry(view, id) {
     view.innerHTML = '<div class="page">' + loadingHtml('正在打开记录…') + '</div>';
+    var e;
     try {
-      currentEntry = await api('/api/entries/' + encodeURIComponent(id));
-    } catch (e) {
-      view.innerHTML = '<div class="page"><a class="back-link" href="#/entries">‹ 返回记录</a>' + errorHtml(e.message) + '</div>';
+      e = await api('/api/entries/' + encodeURIComponent(id));
+    } catch (err) {
+      view.innerHTML = '<div class="page"><a class="back-link" href="#/entries">‹ 返回记录</a>' + errorHtml(err.message) + '</div>';
       return;
     }
-    var e = currentEntry;
+    // A9-04：只有这次请求仍然是「当前路由要渲染的记录」时才覆盖全局，
+    // 否则（用户已切走/切到另一条）写入的是分离 DOM，且会污染新页面的基线
+    var cur = currentRoute();
+    if (cur.name !== 'entry' || String(cur.param) !== String(e.id)) return;
+    currentEntry = e;
+    entryPageId = String(e.id);
+    entryWorkConfirmed = false;
+    markEntryClean();
     view.innerHTML =
       '<div class="page">' +
       '<a class="back-link" href="#/entries">‹ 返回记录</a>' +
@@ -4476,13 +5319,36 @@
       '<p class="hint center">创建于 ' + esc(absTime(e.created_at)) + (e.updated_at && e.updated_at !== e.created_at ? ' · 更新于 ' + esc(absTime(e.updated_at)) : '') + '</p>' +
       '</div>';
 
+    // A9-01：脏状态跟踪。详情页是可编辑表单却没有任何离开保护 —— 点返回、
+    // 点侧栏导航、按浏览器后退都会静默丢弃修改；这里给 9 个可编辑控件统一挂
+    // input/change 监听，配合模块级 beforeunload 与 hashchange 拦截。
+    ['e-time', 'e-title', 'e-content', 'e-summary', 'e-tags', 'e-loc', 'e-wtext', 'e-wtemp', 'e-excl'].forEach(function (fid) {
+      var el = $('#' + fid);
+      if (!el) return;
+      var onEdit = function () { markEntryDirty(id); };
+      el.addEventListener('input', onEdit);
+      el.addEventListener('change', onEdit);
+    });
+
     // 「工作」开关：切换即 PATCH（后端顺带置 is_work_manual=1），以后这条以你为准
     $('#e-work').onclick = async function () {
       var btn = this;
       var next = !(currentEntry && currentEntry.is_work);
+      // A9-30：后端收到 is_work 就写 is_work_manual=1，此后 AI 永久不再重判这条；
+      // 界面上没有任何「撤销人工定论」的入口，首次点击前说明清楚。
+      if (next && !entryWorkConfirmed) {
+        var okWork = await confirmModal(
+          '点亮后，这条记录的「工作」属性就不再由小满判断了（会一直以你的选择为准）。确定吗？',
+          '确定，以我为准'
+        );
+        if (!okWork) return;
+        entryWorkConfirmed = true;
+      }
       btn.disabled = true;
       try {
-        currentEntry = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: { is_work: next } });
+        var patched = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: { is_work: next } });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
+        currentEntry = patched;
         btn.classList.toggle('active', !!currentEntry.is_work);
         toast('已记下，以后这条以你为准', 'success');
       } catch (err) {
@@ -4497,7 +5363,9 @@
       var next = !(currentEntry && currentEntry.starred);
       btn.disabled = true;
       try {
-        currentEntry = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: { starred: next } });
+        var patched = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: { starred: next } });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
+        currentEntry = patched;
         btn.classList.toggle('active', !!currentEntry.starred);
         toast(currentEntry.starred ? '已标记为高光时刻' : '已取消高光', 'success');
       } catch (err) { toast(err.message, 'error'); }
@@ -4520,11 +5388,20 @@
     // 重新获取天气/地点（只是预填，保存前仍可手动改）
     $('#e-wrefetch').onclick = async function () {
       var btn = this;
+      // A9-14：地点维度过去取 currentEntry（服务端快照）而不是用户当前输入，
+      // 手填「公司」后点重新获取会被解析结果无声覆盖。这里先确认，并把
+      // 用户输入的地点文本作为解析依据传下去。
+      var typedLoc = ($('#e-loc').value || '').trim();
+      var snapLoc = (currentEntry && currentEntry.location_name) || '';
+      if (typedLoc && typedLoc !== snapLoc && !await confirmModal(
+        '「' + typedLoc + '」是你手动填写的地点，重新获取会把它替换成解析结果。继续吗？', '继续替换'
+      )) return;
       btn.disabled = true;
       btn.textContent = '获取中…';
       try {
         var day = ($('#e-time').value || '').slice(0, 10) || localDateStr();
-        var lat = currentEntry.latitude, lon = currentEntry.longitude;
+        var lat = currentEntry ? currentEntry.latitude : null;
+        var lon = currentEntry ? currentEntry.longitude : null;
         if ((lat == null || lon == null) && navigator.geolocation) {
           try {
             var pos = await new Promise(function (res, rej) {
@@ -4537,10 +5414,12 @@
         var url = '/api/context/preview?date=' + encodeURIComponent(day);
         if (lat != null && lon != null) url += '&lat=' + lat + '&lon=' + lon;
         var d = await api(url);
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
         if (d.location_name) $('#e-loc').value = d.location_name;
         if (d.weather) {
           $('#e-wtext').value = d.weather.text || '';
           $('#e-wtemp').value = d.weather.temperature_c != null ? d.weather.temperature_c : '';
+          markEntryDirty(id); // 预填改动了输入框，纳入脏保护
           toast('已重新预填，确认无误后点保存', 'success');
         } else {
           toast('没有获取到天气，可能是网络问题，可以手动填写', 'error');
@@ -4553,19 +5432,29 @@
     };
 
     // 保存
+    // A9-27：只提交相对服务端快照真正变化的字段。过去 content 无条件携带，
+    // 后端按「键出现」判断 rejudge → 每次保存都重跑 is_work 重判 + AI 分类 + 嵌入，
+    // 既费配额又让分类标签在用户眼前跳动。
     $('#e-save').onclick = async function () {
       var btn = $('#e-save');
+      var base = currentEntry || {};
       var timeVal = $('#e-time').value;
-      var payload = {
-        title: $('#e-title').value.trim(),
-        summary: $('#e-summary').value.trim(),
-        content: $('#e-content').value,
-        tags: $('#e-tags').value.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean),
-        location_name: $('#e-loc').value.trim(),
-        exclude_from_ai: $('#e-excl').checked
-      };
+      var payload = {};
+      var title = $('#e-title').value.trim();
+      var summary = $('#e-summary').value.trim();
+      var content = $('#e-content').value;
+      var tags = $('#e-tags').value.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
+      var loc = $('#e-loc').value.trim();
+      var excl = $('#e-excl').checked;
+      var origTags = (base.tags || []).join('\u0001');
+      if (title !== (base.title || '')) payload.title = title;
+      if (summary !== (base.summary || '')) payload.summary = summary;
+      if (content !== (base.content || '')) payload.content = content;
+      if (tags.join('\u0001') !== origTags) payload.tags = tags;
+      if (loc !== (base.location_name || '')) payload.location_name = loc;
+      if (excl !== !!base.exclude_from_ai) payload.exclude_from_ai = excl;
       // 天气/温度是预填值：用户没动就不提交；改过标记为手动填写；清空则删除天气
-      var origW = currentEntry.weather || null;
+      var origW = base.weather || null;
       var wText = $('#e-wtext').value.trim();
       var wTempStr = $('#e-wtemp').value.trim();
       var origText = origW && origW.text ? origW.text : '';
@@ -4584,13 +5473,19 @@
         }
       }
       if (timeVal) {
-        var d = new Date(timeVal);
-        if (!isNaN(d.getTime())) payload.occurred_at = d.toISOString();
+        var parsedTime = parseLocalInput(timeVal);
+        if (parsedTime && parsedTime.toISOString() !== new Date(base.occurred_at).toISOString()) {
+          payload.occurred_at = parsedTime.toISOString();
+        }
       }
+      if (!Object.keys(payload).length) { toast('没有需要保存的改动', 'info'); return; }
       btn.disabled = true;
       btn.textContent = '保存中…';
       try {
-        currentEntry = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: payload });
+        var saved = await api('/api/entries/' + encodeURIComponent(id), { method: 'PATCH', body: payload });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
+        currentEntry = saved;
+        markEntryClean(); // A9-01：保存成功即清除脏标记
         // 位置/时间变化时后端会重新预填天气，这里把输入框同步为服务器最新值，避免下次保存用旧值覆盖
         $('#e-loc').value = currentEntry.location_name || '';
         $('#e-wtext').value = currentEntry.weather && currentEntry.weather.text ? currentEntry.weather.text : '';
@@ -4598,12 +5493,13 @@
         // 标题/摘要为空的，后台小模型会补：轮询两次，好了就同步输入框
         if (!currentEntry.title || !currentEntry.summary) pollAutoFill(id, { context: 'entry' });
         btn.textContent = '已保存 ✓';
-        setTimeout(function () { btn.textContent = '保存'; btn.disabled = false; }, 1500);
+        // A9-01：不再用 disabled 阻塞 1.5 秒（那段时间改不了也存不了），只做文案反馈
+        setTimeout(function () { btn.textContent = '保存'; }, 1500);
       } catch (err) {
         toast(err.message, 'error');
         btn.textContent = '保存';
-        btn.disabled = false;
       }
+      btn.disabled = false;
     };
     // 导出这条记录：可选独立网页或 Markdown（含附件打包）
     $('#e-export').onclick = async function () {
@@ -4633,17 +5529,41 @@
     };
     // 唯一的再生成入口（更多细节折叠区底部）：确认后用当前正文强制重新生成
     $('#e-regen').onclick = async function () {
-      var ok = await confirmModal('会用当前正文重新生成标题、摘要和标签，覆盖现有内容。继续吗？', '重新生成');
-      if (!ok) return;
       var btn = this;
+      // A9-02：后端 enrich_entry 取的是**数据库行**的正文，不看前端 textarea。
+      // 过去文案写「用当前正文」，与实现不符；且成功后无条件覆盖标题/摘要/标签，
+      // 把用户手打的内容一起冲掉。这里先说清语义，并只覆盖「与正文对应的」字段。
+      var curContent = $('#e-content').value;
+      var savedContent = (currentEntry && currentEntry.content) || '';
+      var contentDirty = curContent !== savedContent;
+      var msg = contentDirty
+        ? '正文有未保存的修改。本次生成会用「已保存的正文」，并覆盖现有的标题/摘要/标签。建议先点保存再生成。仍要继续吗？'
+        : '会用这条记录已保存的正文重新生成标题、摘要和标签，覆盖现有内容。继续吗？';
+      var ok = await confirmModal(msg, contentDirty ? '仍要继续' : '重新生成');
+      if (!ok) return;
+      // 用户手改过的字段：生成前记下来，回填时跳过，避免无声冲掉
+      var before = {
+        title: $('#e-title').value,
+        summary: $('#e-summary').value,
+        tags: $('#e-tags').value
+      };
       btn.disabled = true;
       btn.textContent = '正在重新生成…';
       try {
-        currentEntry = await api('/api/ai/enrich-entry/' + encodeURIComponent(id), { method: 'POST', body: { force: true }, timeout: 300000 });
-        $('#e-title').value = currentEntry.title || '';
-        $('#e-summary').value = currentEntry.summary || '';
-        $('#e-tags').value = (currentEntry.tags || []).join(', ');
-        toast('已按最新正文重新生成', 'success');
+        var regenerated = await api('/api/ai/enrich-entry/' + encodeURIComponent(id), { method: 'POST', body: { force: true }, timeout: 300000 });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
+        currentEntry = regenerated;
+        var skipped = [];
+        if ($('#e-title').value === before.title) $('#e-title').value = currentEntry.title || '';
+        else skipped.push('标题');
+        if ($('#e-summary').value === before.summary) $('#e-summary').value = currentEntry.summary || '';
+        else skipped.push('摘要');
+        if ($('#e-tags').value === before.tags) $('#e-tags').value = (currentEntry.tags || []).join(', ');
+        else skipped.push('标签');
+        markEntryDirty(id); // 回填改了输入框，需要保存
+        toast(skipped.length
+          ? '已重新生成（你手改过的' + skipped.join('、') + '保持不动，记得保存）'
+          : '已按最新正文重新生成，记得保存', 'success', 5000);
       } catch (err) {
         toast(err.message, 'error', 5000);
       }
@@ -4656,9 +5576,12 @@
       if (!ok) return;
       try {
         await api('/api/entries/' + encodeURIComponent(id), { method: 'DELETE' });
+        markEntryClean(); // A9-01：记录已删，不必再提示未保存
+        entryLeaveOk = true;
         toast('已删除，需要时可以去回收站恢复', 'success');
-        if (history.length > 1) history.back();
-        else location.hash = '#/today';
+        // A9-18：history.length 是整个标签页会话的历史长度，几乎恒 > 1，
+        // 新标签页深链进来删除时会直接退出应用。统一改为显式路由。
+        location.hash = '#/entries';
       } catch (err) { toast(err.message, 'error'); }
     };
     // 添加附件
@@ -4666,21 +5589,38 @@
       var inp = document.createElement('input');
       inp.type = 'file';
       inp.multiple = true;
+      inp.style.display = 'none';
       inp.onchange = async function () {
-        var fs = Array.prototype.slice.call(inp.files || []);
+        // A9-14/A9-04：先做大小预检；上传目标锁定为入口时的 entry id
+        var fs = screenFiles(Array.prototype.slice.call(inp.files || []));
+        inp.remove();
         if (!fs.length) return;
+        var targetId = id;
         var prog = $('#e-progress');
-        prog.classList.remove('hidden');
+        if (prog) prog.classList.remove('hidden');
         try {
-          currentEntry = await uploadFiles(id, fs, function (pct) {
+          var updated = await uploadFiles(targetId, fs, function (pct) {
             var bar = $('#e-bar');
             if (bar) bar.style.width = pct + '%';
           });
+          // A9-04：上传是 XHR，大文件可持续数十秒；期间用户可能已切到另一条记录。
+          // 过去这里整体覆盖全局 currentEntry，随后 renderEntryAtts() 会把旧记录的
+          // 附件画进新记录页，并把保存用的天气基线也换掉。
+          if (String(entryPageId) !== String(targetId) || currentRoute().param !== targetId) return;
+          currentEntry = updated;
           toast('附件已上传', 'success');
           renderEntryAtts();
-        } catch (err) { toast(err.message, 'error'); }
-        finally { prog.classList.add('hidden'); var bar = $('#e-bar'); if (bar) bar.style.width = '0'; }
+        } catch (err) {
+          if (String(entryPageId) === String(targetId)) toast(err.message, 'error');
+        }
+        finally {
+          var prog2 = $('#e-progress');
+          if (prog2) prog2.classList.add('hidden');
+          var bar2 = $('#e-bar');
+          if (bar2) bar2.style.width = '0';
+        }
       };
+      document.body.appendChild(inp);
       inp.click();
     };
     // 附件删除（事件委托）
@@ -4692,6 +5632,7 @@
       if (!ok) return;
       try {
         await api('/api/attachments/' + encodeURIComponent(delBtn.dataset.del), { method: 'DELETE' });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
         currentEntry.attachments = (currentEntry.attachments || []).filter(function (a) {
           return String(a.id) !== String(delBtn.dataset.del);
         });
@@ -4705,7 +5646,9 @@
       if (url == null) return;
       if (!/^https?:\/\//i.test(url)) { toast('链接需要以 http:// 或 https:// 开头', 'error'); return; }
       try {
-        currentEntry = await api('/api/entries/' + encodeURIComponent(id) + '/links', { method: 'POST', body: { url: url } });
+        var updated = await api('/api/entries/' + encodeURIComponent(id) + '/links', { method: 'POST', body: { url: url } });
+        if (String(entryPageId) !== String(id)) return; // A9-04：已切到别的记录
+        currentEntry = updated;
         renderEntryLinks();
         toast('链接已添加', 'success');
       } catch (err) { toast(err.message, 'error'); }
@@ -4789,19 +5732,23 @@
     }
   }
 
-  function renderEntryAtts() {
-    var box = $('#e-atts');
-    if (!box || !currentEntry) return;
-    var atts = currentEntry.attachments || [];
+  // A9-04：显式接收 entry + 容器，不再隐式依赖全局 currentEntry；
+  // 无参调用仍走全局（兼容既有调用点）
+  function renderEntryAtts(entry, container) {
+    var box = container || $('#e-atts');
+    var data = entry || currentEntry;
+    if (!box || !data) return;
+    var atts = data.attachments || [];
     box.innerHTML = atts.length
       ? atts.map(function (a) { return attTileHtml(a, { deletable: true }); }).join('')
       : '<p class="hint att-empty">还没有附件，可以添加照片、视频或文件</p>';
   }
 
-  function renderEntryLinks() {
-    var box = $('#e-links');
-    if (!box || !currentEntry) return;
-    var links = currentEntry.links || [];
+  function renderEntryLinks(entry, container) {
+    var box = container || $('#e-links');
+    var data = entry || currentEntry;
+    if (!box || !data) return;
+    var links = data.links || [];
     box.innerHTML = links.length
       ? links.map(function (l) {
           var href = safeUrl(l.url) || '#';
@@ -4821,6 +5768,7 @@
   var CIRCLE_STATUS_NAME = { active: '待确认', confirmed: '已确认', draft: '已搁置', ended: '已结束', rejected: '已忽略' };
   var circleState = null;
   var backfillTimer = null;
+  var backfillPolling = false; // A9-25：防重复轮询链
 
   function fmtMD(iso) {
     var d = parseDate(iso);
@@ -4831,7 +5779,7 @@
     // 首页的矛盾提醒使用 /circle/review，直接打开冲突收件箱，避免默认 active 为空造成误导。
     var initialRoute = currentRoute();
     var reviewInbox = initialRoute.param === 'review';
-    circleState = { tab: reviewInbox ? 'all' : 'person', status: reviewInbox ? 'review' : 'active', enabled: true };
+    circleState = { tab: reviewInbox ? 'all' : 'person', status: reviewInbox ? 'review' : 'active', enabled: true, seq: 0 };
     var circleTabs = (reviewInbox ? [['all', '全部']] : []).concat(CIRCLE_TYPES)
       .map(function (kv) {
         return '<button class="pill' + (circleState.tab === kv[0] ? ' active' : '') + '" data-ctab="' + kv[0] + '">' + kv[1] + '</button>';
@@ -4895,6 +5843,8 @@
     loadProposals();
     loadQuestions();
     loadAutoLog();
+    // A9-26：若上一轮回填还在进行，回到圈子页时恢复进度显示与轮询
+    if (backfillPolling) pollBackfill();
   }
 
   /* ---- 小满想跟你确认（合并提案，pending 才显示） ---- */
@@ -4932,7 +5882,9 @@
     btn.disabled = true;
     try {
       await api('/api/circle/proposals/' + encodeURIComponent(id) + '/' + act, { method: 'POST' });
+      // A9-17：btn.closest 可能为 null（DOM 已被重建），过去会抛未捕获 TypeError
       var card = btn.closest('.prop-card');
+      if (!card) { toast(act === 'accept' ? '已合并' : '好，它们不是同一个', 'success'); loadCircle(); return; }
       card.style.opacity = '0';
       setTimeout(function () {
         card.remove();
@@ -5140,10 +6092,16 @@
       fadeQuRow(row);
       toast('已记下', 'success');
     } catch (e) {
-      if (e.status === 400) {
-        // 批量作答已答过的行滞留卡内时：单点会 400，视为已答，淡出即可
+      // A9-20：后端对同一路由返回 400 的原因有两种——「该问题已回答或已关闭」与
+      // 「choice_index 超出范围」。过去把两者都当成「已答过」并静默移除该行，
+      // 下标越界（列表过期）时用户会以为已作答，实际数据并未写入。
+      if (e.status === 400 && String(e.message || '').indexOf('已经答过') >= 0) {
         fadeQuRow(row);
         toast('这条已经答过了', 'info');
+      } else if (e.status === 400) {
+        toast(e.message, 'error');
+        btn.disabled = false;
+        loadQuestions(); // 拉取权威分组，避免继续在过期列表上操作
       } else {
         toast(e.message, 'error');
         btn.disabled = false;
@@ -5182,9 +6140,11 @@
       var r = await api('/api/circle/questions/answer-batch', { method: 'POST', body: { answers: answers } });
       var failed = (r && r.failed) || 0;
       if (failed > 0) {
-        // 有没记上的：一行都不动，留给用户单独点选
+        // 保留分支：后端当前是「整批预校验、全成或全败」，failed 恒为 0；
+        // 若将来改为逐条结果，这里仍能正确降级。
         toast('有 ' + failed + ' 条没记上，请单独点选', 'error', 4500);
         btn.disabled = false;
+        loadQuestions();
         return;
       }
       answeredRows.forEach(function (row) { fadeQuRow(row); });
@@ -5201,6 +6161,10 @@
     } catch (e) {
       toast(e.message, 'error');
       btn.disabled = false;
+      // A9-21：整批 400（含「其中一题已被答过」）时，前端过去只弹一句后端文案、
+      // 已成功的行不淡出 → 界面停在「看起来都没答」，用户重复点又命中 400。
+      // 改为重新拉取权威分组，让界面回到实际状态。
+      if (e.status === 400) loadQuestions();
     }
   }
 
@@ -5285,18 +6249,24 @@
   async function loadEntities() {
     var box = $('#circle-box');
     if (!box) return;
+    // A9-09：tab/状态切换没有请求序号时，后返回的旧结果会把新 tab 的内容覆盖，
+    // 造成「高亮是关系、内容是卡片列表」。用序号丢弃过期响应。
+    var seq = ++circleState.seq;
+    // A9-10：快照发起时的 tab/status，渲染前再次比对
+    var tab = circleState.tab, status = circleState.status;
     box.innerHTML = loadingHtml();
     try {
-      var qs = circleState.tab === 'all' ? '' : ('?type=' + encodeURIComponent(circleState.tab));
-      if (circleState.status === 'review') {
+      var qs = tab === 'all' ? '' : ('?type=' + encodeURIComponent(tab));
+      if (status === 'review') {
         qs += (qs ? '&' : '?') + 'status=all&needs_review=1';
       } else {
-        qs += (qs ? '&' : '?') + 'status=' + encodeURIComponent(circleState.status);
+        qs += (qs ? '&' : '?') + 'status=' + encodeURIComponent(status);
       }
       var data = await api('/api/circle/entities' + qs);
+      if (seq !== circleState.seq || tab !== circleState.tab || status !== circleState.status) return;
       var items = (data && data.items) || [];
       if (!items.length) {
-        if (circleState.tab === 'person' && circleState.status === 'active') {
+        if (tab === 'person' && status === 'active') {
           box.innerHTML =
             '<div class="card summary-guide">' +
             '<svg class="empty-ic"><use href="#i-users"/></svg>' +
@@ -5304,11 +6274,12 @@
             '<p class="empty-sub">已确认的档案可在「已确认」里查看；重新扫描会继续整理新记录</p>' +
             '<button class="btn btn-ghost" id="circle-backfill">从全部记录建立档案</button>' +
             '</div>';
-          $('#circle-backfill').onclick = startBackfill;
+          var bf = $('#circle-backfill');
+          if (bf) bf.onclick = startBackfill;
         } else {
           box.innerHTML = emptyHtml(
-            circleState.status === 'review' ? '没有待裁定的矛盾' : (circleState.status === 'active' ? '没有待确认的档案' : '这里还空着'),
-            circleState.status === 'review' ? '新的证据出现时，小满会把冲突放到这里' : (circleState.status === 'active' ? '小满整理出新档案时会放在这里，确认后就正式启用' : '换个状态或类型看看')
+            status === 'review' ? '没有待裁定的矛盾' : (status === 'active' ? '没有待确认的档案' : '这里还空着'),
+            status === 'review' ? '新的证据出现时，小满会把冲突放到这里' : (status === 'active' ? '小满整理出新档案时会放在这里，确认后就正式启用' : '换个状态或类型看看')
           );
         }
         return;
@@ -5318,6 +6289,7 @@
         card.onclick = function () { openCircleDetail(card.dataset.cid); };
       });
     } catch (e) {
+      if (seq !== circleState.seq) return;
       box.innerHTML = errorHtml(e.message);
     }
   }
@@ -5342,9 +6314,12 @@
   async function loadRelations() {
     var box = $('#circle-box');
     if (!box) return;
+    // A9-09：与 loadEntities 共用同一序号，切 tab 时后返回的旧响应会被丢弃
+    var seq = ++circleState.seq;
     box.innerHTML = loadingHtml();
     try {
       var data = await api('/api/circle/graph');
+      if (seq !== circleState.seq || circleState.tab !== 'relations') return;
       var nodes = (data && data.nodes) || [];
       var links = (data && data.links) || [];
       if (!nodes.length) {
@@ -5460,10 +6435,11 @@
       return { n: n, size: n.status === 'draft' ? Math.max(18, Math.round(size * 0.8)) : size };
     });
     // 标签默认只显 degree Top5 且 size≥30，其余 hover 才出；节点多时避免中心文字互相覆盖。
-    var top8 = {};
+    // A9-33(1)：变量名 top8 与实际取 Top5 不符，改名为 topLabeled 以免误读。
+    var topLabeled = {};
     sized.slice().filter(function (s) { return s.n.status !== 'draft'; })
       .sort(function (a, b) { return (b.n.degree || 0) - (a.n.degree || 0); })
-      .slice(0, 5).forEach(function (s) { top8[String(s.n.id)] = 1; });
+      .slice(0, 5).forEach(function (s) { topLabeled[String(s.n.id)] = 1; });
     var data = sized.map(function (s) {
       var n = s.n;
       var color = REL_COLORS[n.type] || CHART_COLORS.brown;
@@ -5482,7 +6458,7 @@
         category: REL_CAT_IDX[n.type] != null ? REL_CAT_IDX[n.type] : 0,
         symbolSize: s.size,
         itemStyle: style,
-        label: { show: !!(top8[String(n.id)] && s.size >= 30), position: 'bottom', distance: 6, fontSize: 11, color: CHART_COLORS.labelText },
+        label: { show: !!(topLabeled[String(n.id)] && s.size >= 30), position: 'bottom', distance: 6, fontSize: 11, color: CHART_COLORS.labelText },
         emphasis: { label: { show: true } }
       };
     });
@@ -5649,8 +6625,9 @@
         var chipHtml = function (c) {
           var status = c.status ? '<span class="rl-meta">' + esc(c.status) + '</span>' : '';
           var certainty = c.certainty ? '<span class="rl-meta">' + esc(c.certainty) + '</span>' : '';
+          // A9-16：与 relationsListHtml / 详情 modal 统一——进入 HTML 模板的动态值必须过 esc()
           var dates = (c.valid_from || c.valid_to) ? '<span class="rl-meta">' +
-            (c.valid_from ? '自 ' + fmtMD(c.valid_from) : '') + (c.valid_to ? ' 至 ' + fmtMD(c.valid_to) : '') + '</span>' : '';
+            (c.valid_from ? '自 ' + esc(fmtMD(c.valid_from)) : '') + (c.valid_to ? ' 至 ' + esc(fmtMD(c.valid_to)) : '') + '</span>' : '';
           return '<span class="rl-chip">' + esc(c.text) + status + certainty + dates + (c.entry_id
             ? ' <a class="rel-source-link" href="#/entry/' + encodeURIComponent(c.entry_id) + '" title="打开来源记录">来源</a>'
             : '') + '</span>';
@@ -5696,12 +6673,22 @@
 
   /* ---- backfill 建立档案 ---- */
   async function startBackfill() {
+    // A9-25：「重新扫描」过去可重复点击，每次都会起一条独立的 2 秒轮询链，
+    // 而 backfillTimer 只存最后一个句柄，旧链成为后台泄漏的轮询。
+    if (backfillPolling) { toast('正在整理档案，请稍候…', 'info'); return; }
+    backfillPolling = true;
+    var btn = $('#circle-rescan');
+    if (btn) btn.disabled = true;
     try {
       await api('/api/circle/backfill', { method: 'POST' });
     } catch (e) {
       toast(e.message, 'error');
+      backfillPolling = false;
+      if (btn) btn.disabled = false;
       return;
     }
+    // A9-26：把「正在回填」落到状态里，切走再回来能恢复进度显示
+    if (circleState) circleState.backfilling = true;
     pollBackfill();
   }
 
@@ -5712,31 +6699,48 @@
       if (st && !st.done) {
         if (prog && document.body.contains(prog)) {
           prog.innerHTML = '<p class="hint">正在翻你的记录 ' + esc(st.processed_days) + '/' + esc(st.total_days) + ' 天…</p>';
-          backfillTimer = setTimeout(pollBackfill, 2000);
         }
+        // A9-26：容器不存在时过去直接不再调度 → 轮询静默终止、回到圈子页也没有进度。
+        // 现在无论容器在不在都继续轮询（写 DOM 时才判空）。
+        backfillTimer = setTimeout(pollBackfill, 2000);
       } else {
         if (prog && document.body.contains(prog)) prog.innerHTML = '';
         toast('档案整理好了', 'success');
+        backfillPolling = false;
+        if (circleState) circleState.backfilling = false;
+        var btn = $('#circle-rescan');
+        if (btn) btn.disabled = false;
         loadCircle();
       }
-    } catch (e) { /* 停止本轮轮询 */ }
+    } catch (e) {
+      // 停止本轮轮询，并释放守卫，避免按钮永久禁用
+      backfillPolling = false;
+      if (circleState) circleState.backfilling = false;
+      var btn2 = $('#circle-rescan');
+      if (btn2) btn2.disabled = false;
+    }
   }
 
   /* ---- 实体详情 modal ---- */
   async function openCircleDetail(id) {
-    var root = $('#modal-root');
+    // A9-29：快速连续打开两个实体时，先到的响应会写进后来者的 modal。
+    // 用 modal token 校验「这还是不是我创建的那个弹窗」。
+    var m = openModalRoot();
+    var root = m.root;
     root.innerHTML = '<div class="modal-wrap"><div class="modal circle-modal">' + loadingHtml() + '</div></div>';
     $('.modal-wrap', root).addEventListener('click', function (e) {
-      if (e.target.classList.contains('modal-wrap')) closeModal();
+      if (e.target.classList.contains('modal-wrap')) closeModal(m.token);
     });
     var d;
     try {
       d = await api('/api/circle/entities/' + encodeURIComponent(id));
     } catch (e) {
-      var m = $('#modal-root .modal');
-      if (m) m.innerHTML = errorHtml(e.message);
+      if (modalSerial !== m.token) return; // 已被别的弹窗取代
+      var mEl = $('#modal-root .modal');
+      if (mEl) mEl.innerHTML = errorHtml(e.message);
       return;
     }
+    if (modalSerial !== m.token) return; // 过期响应：不再写入
     renderCircleDetail(d);
   }
 
@@ -5885,6 +6889,8 @@
         okText: '重新整理'
       });
       if (desc == null) return;
+      // A9-33(8)：只挡了 null，空字符串会触发一次无意义（且可能耗时 180 秒）的 AI 调用
+      if (!String(desc).trim()) { toast('先写点什么吧', 'error'); return; }
       btn.disabled = true;
       btn.textContent = '整理中…';
       try {
@@ -5893,7 +6899,8 @@
         });
         toast('已按你的描述重新整理', 'success');
         closeModal();
-        loadEntities();  // 列表即时刷新，确认过的从待确认消失
+        // A9-10：走 tab 分发，避免在「关系」tab 下把力导向图替换成实体卡片列表
+        loadCircle();  // 列表即时刷新，确认过的从待确认消失
       } catch (e) {
         toast(e.message, 'error', 6000);
         btn.disabled = false;
@@ -5906,7 +6913,7 @@
       await api('/api/circle/entities/' + encodeURIComponent(d.id) + '/' + act, { method: 'POST' });
       toast(act === 'confirm' ? '已确认，小满会顺带整理相关档案' : act === 'reject' ? '好，以后不再提起' : '已恢复', 'success');
       closeModal();
-      loadEntities();
+      loadCircle(); // A9-10：按当前 tab 分发（关系 tab 下要重画图，而不是换成卡片列表）
     } catch (e) {
       toast(e.message, 'error');
       btn.disabled = false;
@@ -5922,7 +6929,7 @@
       });
       toast(action === 'keep_old' ? '好，维持原样' : '已按新证据重整', 'success');
       closeModal();
-      loadEntities();
+      loadCircle(); // A9-10：按当前 tab 分发
     } catch (e) {
       toast(e.message, 'error');
       btn.disabled = false;

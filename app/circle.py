@@ -21,6 +21,9 @@ from . import ai as ai_mod, db, logx
 
 SYNTH_INTERVAL = timedelta(hours=1)
 TYPE_LABEL = {"person": "人物", "place": "地点", "event": "事件"}
+# 关系图明细清单的服务端上限（A9-11）：图本身（nodes/links）不受限，只有 relations
+# 明细截断，并如实回 relations_total / relations_truncated 供前端提示。
+GRAPH_RELATIONS_CAP = 2000
 
 _backfill_lock = threading.Lock()
 
@@ -32,6 +35,23 @@ CERTAINTY_RANK = {"ambiguous": 0, "inferred": 1, "explicit": 2}
 def enabled() -> bool:
     """圈子总开关（默认开）。关闭时：不提取、不综合、不复查、不注入、不回填。"""
     return db.get_setting("circle_enabled", "true") != "false"
+
+
+def _parse_ts(raw: str) -> datetime | None:
+    """宽容解析设置项里的时间戳；无法解析或**无时区**（naive）一律返回 None。
+
+    A6b-11：`now` 是 aware（`tick` 传 `datetime.now().astimezone()`），与 naive 值相减抛
+    `TypeError`，而调用点原先只捕 `ValueError` → 异常冒泡到 tick 的静默兜底，
+    合并提案流程**永久停摆**。naive/脏值一律当"无法判断"，由调用方按"已过期，继续执行"
+    处理（安全方向是继续做，而不是永久跳过）。
+    """
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+    return ts if ts.tzinfo is not None else None
 
 
 def auto_confirm_on() -> bool:
@@ -436,7 +456,9 @@ def maybe_create_question(mention: dict, known_as: str, entry_id: str) -> str | 
 
 def answer_question(qid: str, choice_index: int) -> dict:
     """回答提问：选中候选→提及挂到该实体+别名并入；'都不是'→仅关闭。
-    M4：仅 pending 可答；已答/已忽略重复答抛 bad state（主站单答/批量/agent 同获益）。"""
+    M4：仅 pending 可答；已答/已忽略重复答抛 bad state（主站单答/批量/agent 同获益）。
+    A3-26：选项指向的档案已被合并/删除时抛 stale，不再"什么都不做却回成功"——
+    用户会以为记录被整理过，实际数据零变化（related_json 无外键，实体合并后 ID 会变陈旧）。"""
     row = db.q1("SELECT * FROM circle_questions WHERE id=?", (qid,))
     if row is None:
         raise ValueError("not found")
@@ -462,41 +484,62 @@ def answer_question(qid: str, choice_index: int) -> dict:
         entity_ids = related.get("entity_ids") or []
         if choice_index < len(entity_ids):
             target = get_entity(entity_ids[choice_index])
-            if target is not None:
-                mention_name = related.get("mention_name") or ""
-                entry_id = related.get("entry_id") or ""
-                snippet = related.get("snippet") or ""
-                # orphan 收窄到与答案目标同类型（R2：跨类型"同名"极易认错，宁可不迁移）
-                orphan = _find_by_name(mention_name, target["type"])
-                if orphan is not None and orphan["id"] == target["id"]:
-                    orphan = None
-                if orphan is not None:
-                    # 有 orphan：直接迁移它的提及（先按 entry 去重，避免同 entry 双行），
-                    # 不再 upsert——upsert 会重复插入同一 (entity, entry) 提及（I1）
+            if target is None:
+                # A3-26：选中的候选档案已被合并/删除 → 静默 no-op 会让用户以为
+                # "这个称呼已经归好了"。抛错让路由回 409 并提示刷新提问列表，
+                # 且**不**把问题置 answered，用户仍可在刷新后的新卡上作答。
+                raise ValueError("stale")
+            mention_name = related.get("mention_name") or ""
+            entry_id = related.get("entry_id") or ""
+            snippet = related.get("snippet") or ""
+            # orphan 收窄到与答案目标同类型（R2：跨类型"同名"极易认错，宁可不迁移）
+            orphan = _find_by_name(mention_name, target["type"])
+            if orphan is not None and orphan["id"] == target["id"]:
+                orphan = None
+            if orphan is not None:
+                # 有 orphan：直接迁移它的提及（先按 entry 去重，避免同 entry 双行），
+                # 不再 upsert——upsert 会重复插入同一 (entity, entry) 提及（I1）
+                with db.locked() as c:
+                    c.execute(
+                        "DELETE FROM entity_mentions WHERE entity_id=? AND entry_id IN "
+                        "(SELECT entry_id FROM entity_mentions WHERE entity_id=?)",
+                        (orphan["id"], target["id"]),
+                    )
+                    c.execute("UPDATE entity_mentions SET entity_id=? WHERE entity_id=?",
+                              (target["id"], orphan["id"]))
+                    c.commit()
+                cnt = db.q1("SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?",
+                            (target["id"],))["n"]
+                db.execute("UPDATE entities SET mention_count=?, updated_at=? WHERE id=?",
+                           (cnt, db.now_iso(), target["id"]))
+                # 空壳 draft 清理
+                left = db.q1("SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?",
+                             (orphan["id"],))["n"]
+                if left == 0 and orphan["status"] == "draft" and not orphan["user_note"]:
+                    # A6b-09：原先直接 `DELETE FROM entities` —— 这是 A3-01 同根因的
+                    # 第二条触发路径。entity_facts 是 ON DELETE CASCADE + 外键已开，
+                    # 孤儿档案的历史事实会被静默级联删除；而 entity_relations.target_id
+                    # 没有外键（db.py），以它为 target 的边会变成悬空边（图上消失、
+                    # 详情页显示"（已删除）"，两种界面给出不同事实）。
+                    # 既然用户刚确认"这个称呼就是《target》"，孤儿的事实/关系本就
+                    # 该归到 target：迁移后收口，再删空壳。
                     with db.locked() as c:
-                        c.execute(
-                            "DELETE FROM entity_mentions WHERE entity_id=? AND entry_id IN "
-                            "(SELECT entry_id FROM entity_mentions WHERE entity_id=?)",
-                            (orphan["id"], target["id"]),
-                        )
-                        c.execute("UPDATE entity_mentions SET entity_id=? WHERE entity_id=?",
+                        _migrate_child_facts(c, orphan["id"], target["id"])
+                        c.execute("UPDATE entity_relations SET source_id=? WHERE source_id=?",
                                   (target["id"], orphan["id"]))
+                        c.execute("UPDATE entity_relations SET target_id=? WHERE target_id=?",
+                                  (target["id"], orphan["id"]))
+                        c.execute("DELETE FROM entity_relations WHERE source_id=target_id")
+                        c.execute("DELETE FROM entities WHERE id=?", (orphan["id"],))
                         c.commit()
-                    cnt = db.q1("SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?",
-                                (target["id"],))["n"]
-                    db.execute("UPDATE entities SET mention_count=?, updated_at=? WHERE id=?",
-                               (cnt, db.now_iso(), target["id"]))
-                    # 空壳 draft 清理
-                    left = db.q1("SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?",
-                                 (orphan["id"],))["n"]
-                    if left == 0 and orphan["status"] == "draft" and not orphan["user_note"]:
-                        db.execute("DELETE FROM entities WHERE id=?", (orphan["id"],))
-                else:
-                    # 无 orphan：提及挂到目标实体（日期按 entry 回查，不抹时间戳）
-                    upsert_mention(target["name"], target["type"], snippet or mention_name,
-                                   entry_id, "", known_as=target["name"])
-                _merge_alias(target, mention_name)
-                logx.log("圈子：称呼已确认", f"「{mention_name}」就是《{target['name']}》")
+                    logx.log("圈子：清理空壳档案",
+                             f"《{orphan['name']}》已并入《{target['name']}》，事实与关系一并迁移")
+            else:
+                # 无 orphan：提及挂到目标实体（日期按 entry 回查，不抹时间戳）
+                upsert_mention(target["name"], target["type"], snippet or mention_name,
+                               entry_id, "", known_as=target["name"])
+            _merge_alias(target, mention_name)
+            logx.log("圈子：称呼已确认", f"「{mention_name}」就是《{target['name']}》")
     db.execute("UPDATE circle_questions SET status='answered', answer=? WHERE id=?",
                (choice, qid))
     return {"answer": choice}
@@ -517,10 +560,58 @@ def _same_fact_value(a: str, b: str) -> bool:
     return na == nb or na in nb or nb in na
 
 
+def _migrate_child_facts(c, from_id: str, into_id: str) -> dict:
+    """把 from 档案的时序事实迁到 into，并做同 predicate 去重收口（须在同一事务内调用）。
+
+    A3-01：`entity_facts.entity_id` 是 `REFERENCES entities(id) ON DELETE CASCADE`，
+    而连接开着 `PRAGMA foreign_keys=ON`（db.py）。任何 `DELETE FROM entities` 都会
+    **静默级联删除**该档案的全部时序事实（不可恢复），因此删档案前必须先迁移。
+
+    迁移后必须收口：两个档案各自可能都有「任职于/居住在」这类 predicate，直接迁移
+    会造出同一 predicate 两条 `valid_to IS NULL` 的活跃值，破坏 temporal.py 依赖的
+    「同 predicate 至多一个活跃值」不变式。按 (valid_from, created_at) 保留最新一条，
+    其余封存；封存日取保留者的生效日，并保证不早于被封存者自身的生效日（防倒挂）。
+
+    返回快照 `{"facts": 迁移条数, "sealed": 收口封存条数}`，供调用方写审计日志。
+    """
+    if not from_id or not into_id or from_id == into_id:
+        return {"facts": 0, "sealed": 0}
+    row = c.execute("SELECT COUNT(*) AS n FROM entity_facts WHERE entity_id=?",
+                    (from_id,)).fetchone()
+    moved = row["n"] if row is not None else 0
+    if not moved:
+        return {"facts": 0, "sealed": 0}
+    c.execute("UPDATE entity_facts SET entity_id=? WHERE entity_id=?", (into_id, from_id))
+    today = db.now_iso()[:10]
+    active = c.execute(
+        "SELECT id, predicate, valid_from, created_at FROM entity_facts "
+        "WHERE entity_id=? AND valid_to IS NULL "
+        "ORDER BY predicate, valid_from DESC, created_at DESC",
+        (into_id,),
+    ).fetchall()
+    keep: dict[str, str] = {}
+    sealed = 0
+    for f in active:
+        pred = f["predicate"]
+        if pred not in keep:
+            keep[pred] = str(f["valid_from"] or "")
+            continue
+        own_from = str(f["valid_from"] or "")
+        end = keep[pred] or today
+        if own_from and end < own_from:
+            end = own_from
+        c.execute("UPDATE entity_facts SET valid_to=? WHERE id=?", (end, f["id"]))
+        sealed += 1
+    return {"facts": moved, "sealed": sealed}
+
+
 def _apply_facts(entity_id: str, entity_name: str, facts: list, old_profile: str) -> None:
     """时序事实落库（双时态）：同 predicate 的活跃 fact 与新值不同（归一化比较）→ 旧值
-    valid_to=今天封存，新 fact 生效并写可撤销日志；没有活跃 fact 则直接建档。
-    ambiguous 的变化不封存，只 needs_review 等用户过目；confirmed 实体不降级。"""
+    用**新值的实际生效日**封存，新 fact 生效并写可撤销日志；没有活跃 fact 则直接建档。
+    ambiguous 的变化不封存，只 needs_review 等用户过目；confirmed 实体不降级。
+
+    A0-16/A0-17（写入端）：valid_from 与关系侧同口径做 ISO 校验；封存日不再一律写"今天"。
+    """
     today = db.now_iso()[:10]
     src = db.q1("SELECT entry_id FROM entity_mentions WHERE entity_id=? "
                 "ORDER BY created_at DESC LIMIT 1", (entity_id,))
@@ -530,7 +621,9 @@ def _apply_facts(entity_id: str, entity_name: str, facts: list, old_profile: str
         if not (predicate and obj):
             continue
         certainty = f.get("certainty") if f.get("certainty") in ("explicit", "inferred", "ambiguous") else "inferred"
-        valid_from = str(f.get("valid_from") or "").strip()[:10] or today
+        # A0-17：复用关系侧的 ISO 校验（原先只做 [:10] 截断不校验，"2026-3-5"/"去年"这类
+        # 非规范值会被字符串比较永久判为"未生效"，事实从所有快照里静默消失）。
+        valid_from = _relation_day(f.get("valid_from"), today)
         active = db.q1(
             "SELECT * FROM entity_facts WHERE entity_id=? AND predicate=? AND valid_to IS NULL "
             "ORDER BY created_at DESC LIMIT 1",
@@ -545,7 +638,16 @@ def _apply_facts(entity_id: str, entity_name: str, facts: list, old_profile: str
                 (f"「{predicate}」似乎变成了「{obj}」，等你过目", db.now_iso(), entity_id))
             continue
         if active is not None:
-            db.execute("UPDATE entity_facts SET valid_to=? WHERE id=?", (today, active["id"]))
+            # A0-16：封存日取"新值的实际生效日"而不是一律"今天"。旧写法在用历史记录回填时
+            # 会让旧值 [..., valid_to=今天] 与新值 [valid_from=历史日, ...] 区间重叠十几个
+            # 月，同一 predicate 在同一时点同时"有效"，模型会拿到两个互相矛盾的事实。
+            # 关系侧的 end_day = valid_to or evidence_day or now[:10]（circle.py:799）已是
+            # 正确口径，此处与之对齐；新值没有可信生效日（回退 today）或新值更早时才退回今天。
+            old_from = str(active["valid_from"] or "")[:10]
+            end = valid_from if (old_from and valid_from > old_from) else today
+            if old_from and end < old_from:
+                end = old_from  # 防倒挂：封存日不得早于旧值自身的生效日
+            db.execute("UPDATE entity_facts SET valid_to=? WHERE id=?", (end, active["id"]))
         fid = db.new_id()
         db.execute(
             "INSERT INTO entity_facts(id, entity_id, predicate, object_text, valid_from, "
@@ -829,21 +931,33 @@ def _upsert_relations(source_id: str, relations: list, confidence: float) -> Non
 
 
 def _queue_notice(names: list[str]) -> None:
+    """把新认识的实体名追加进 circle_notice 队列（前端取走即清）。
+
+    A3-16：读-改-写放进同一临界区。原先 `get_setting` → `set_setting` 两步之间锁已释放，
+    与 main.py 的 `circle_notice` 路由（F3 已改成单事务取走+清空）交错会**永久丢通知**：
+    路由读到 [A] → 本函数读 [A] 追加 B 写回 [A,B] → 路由写 "" ⇒ B 消失。
+    """
     if not names:
         return
-    pending = []
-    raw = db.get_setting("circle_notice")
-    if raw:
-        try:
-            pending = json.loads(raw).get("names") or []
-        except ValueError:
-            pending = []
-    for n in names:
-        if n not in pending:
-            pending.append(n)
-    text = f"小满新认识了 {len(pending)} 位朋友：" + "".join(f"《{n}》" for n in pending)
-    db.set_setting("circle_notice", json.dumps(
-        {"text": text, "names": pending, "ts": db.now_iso()}, ensure_ascii=False))
+    with db.locked() as c:
+        row = c.execute("SELECT value FROM settings WHERE key='circle_notice'").fetchone()
+        raw = row["value"] if row is not None else ""
+        pending = []
+        if raw:
+            try:
+                pending = json.loads(raw).get("names") or []
+            except (ValueError, AttributeError):
+                pending = []
+        for n in names:
+            if n not in pending:
+                pending.append(n)
+        text = f"小满新认识了 {len(pending)} 位朋友：" + "".join(f"《{n}》" for n in pending)
+        c.execute(
+            "INSERT INTO settings(key, value) VALUES('circle_notice', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (json.dumps({"text": text, "names": pending, "ts": db.now_iso()},
+                        ensure_ascii=False),),
+        )
 
 
 def synthesize_one(row) -> bool:
@@ -1051,11 +1165,16 @@ def _backfill_one_day(day: str, rows) -> None:
 
 # ---------------- 关系图数据 ----------------
 
-def graph_data() -> dict:
+def graph_data(relations_cap: int = GRAPH_RELATIONS_CAP) -> dict:
     """关系图只展示当前有效关系，附带清单所需的已结束历史。
 
     draft 是尚未坐实的候选档案，不能参与关系图，否则会把猜测当成事实，
     也会让节点和边数量随扫描过程膨胀。前端若需要查看 draft，仍可在实体列表里筛选。
+
+    A9-11：补服务端上限。原先一次返回全部节点与全部关系、无分页无上限，档案与关系到千级
+    时前端要把每条关系都塞进 DOM（`relationsGroupHtml` 对每条生成两个 chip），是明确的内存
+    与主线程压力。这里只对 `relations` 明细设上限（默认 2000，远超正常使用规模），并把
+    真实总数与是否截断如实回给前端；`nodes`/`links`（图本身）不受限，避免图形缺节点。
     """
     rows = db.q(
         "SELECT id, name, type, status, mention_count FROM entities "
@@ -1065,7 +1184,9 @@ def graph_data() -> dict:
     relations = []
     visual_pairs: dict[tuple[str, str], dict] = {}
     degree: dict[str, int] = {}
-    # draft 关系本身也不画；同时再次校验两端节点，避免历史脏数据漏进图。
+    truncated = False
+    # draft 关系本身也不画；同时再次校验两端节点，避免历史脏数据漏进图
+    # （entity_relations.target_id 没有外键，删实体后可能留下悬空边）。
     for l in db.q(
         "SELECT source_id, target_id, label, status, entry_id, snippet, valid_from, "
         "valid_to, certainty, updated_at FROM entity_relations "
@@ -1096,6 +1217,7 @@ def graph_data() -> dict:
         grouped["relation_count"] += 1
         if l["valid_from"] and (not grouped["valid_from"] or l["valid_from"] < grouped["valid_from"]):
             grouped["valid_from"] = l["valid_from"]
+    active_total = len(relations)
     # 力导向图只画当前关系；下方折叠清单保留已结束的关系段，用户才能看见
     # “以前是什么、何时结束”，而不是把人物关系误读成永远不变。
     for l in db.q(
@@ -1118,20 +1240,42 @@ def graph_data() -> dict:
         grouped["label"] = "、".join(labels[:2]) + (f"等{len(labels)}种关联" if len(labels) > 2 else "")
         grouped["evidence"] = grouped["evidence"][:5]
         links.append(grouped)
+    relations_total = len(relations)
+    if relations_total > relations_cap:
+        # 截断发生在明细清单上；图（nodes/links）不受影响，前端可据 total 提示"仅显示前 N 条"
+        relations = relations[:relations_cap]
+        truncated = True
     nodes = [
         {"id": r["id"], "name": r["name"], "type": r["type"], "status": r["status"],
          "mention_count": r["mention_count"], "degree": degree.get(r["id"], 0)}
         for r in rows
     ]
-    return {"nodes": nodes, "links": links, "relations": relations}
+    return {"nodes": nodes, "links": links, "relations": relations,
+            "relations_total": relations_total, "relations_truncated": truncated,
+            "active_relations_total": active_total}
 
 
 # ---------------- 合并 ----------------
 
 def merge_entities(from_id: str, into_id: str) -> None:
+    """把 from 档案并入 into（提及/关系/时序事实/别名随迁），并写一条可审计日志。
+
+    A3-01：原先只迁移 mentions 与 relations 就 `DELETE FROM entities`，源档案的全部
+    entity_facts 被外键级联静默删除（不可恢复）——这是本模块最严重的单点缺陷。
+    现在在同一事务内、DELETE 之前先迁移事实并做同 predicate 去重收口。
+    """
+    # 纵深防御：路由层已挡 from==into，但 merge_proposals 的 id 列无外键/约束，
+    # 脏数据会让下面的 DELETE 把档案自己删掉（A6b-28）。
+    if from_id == into_id:
+        raise ValueError("same entity")
     src, dst = get_entity(from_id), get_entity(into_id)
     if src is None or dst is None:
         raise ValueError("not found")
+    # 合并前的快照：facts 条数与收口结果都要进审计日志（用户要能看出这次合并动了什么）
+    facts_snapshot = db.q1(
+        "SELECT COUNT(*) AS n FROM entity_facts WHERE entity_id=?", (from_id,))["n"]
+    mentions_snapshot = db.q1(
+        "SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?", (from_id,))["n"]
     with db.locked() as c:
         # 提及迁移（同 entry 去重）
         c.execute(
@@ -1143,8 +1287,32 @@ def merge_entities(from_id: str, into_id: str) -> None:
         # 关系迁移
         c.execute("UPDATE entity_relations SET source_id=? WHERE source_id=?", (into_id, from_id))
         c.execute("UPDATE entity_relations SET target_id=? WHERE target_id=?", (into_id, from_id))
+        # 时序事实迁移 + 同 predicate 去重收口（必须在 DELETE 之前，否则被级联删除）
+        fact_stat = _migrate_child_facts(c, from_id, into_id)
         # 迁移后可能产生自环（自己指向自己），清掉
         c.execute("DELETE FROM entity_relations WHERE source_id=target_id")
+        # 迁移后残留的幽灵提案：其余 pending 提案里指向已删 from 的行永远无法接受
+        # （merge_entities 抛 not found → 路由 404，且永久卡 pending，A6b-28）。
+        # 标记为 stale 而不是删除，保留"曾经提过这一对"的可读状态。
+        c.execute("UPDATE merge_proposals SET status='stale' "
+                  "WHERE status='pending' AND (from_id=? OR into_id=?)", (from_id, from_id))
+        # 黑名单也要跟着档案走：rejected_pairs 是裸 TEXT 无外键，指向已删 from 的行会
+        # 永久占位（且 a_id/b_id 必须保持「排序后成对」的不变式，见 _pair_key）。
+        # 用户否决的是"X 与 from 不是同一个"；from 并入 into 后该判断应记在 into 名下，
+        # 才能继续阻止"再把 X 并进这一簇"。重排键值后按主键幂等写回，再删旧行。
+        dead_pairs = c.execute(
+            "SELECT a_id, b_id FROM rejected_pairs WHERE a_id=? OR b_id=?",
+            (from_id, from_id),
+        ).fetchall()
+        for p in dead_pairs:
+            a = into_id if p["a_id"] == from_id else p["a_id"]
+            b = into_id if p["b_id"] == from_id else p["b_id"]
+            if a == b:
+                continue  # 自配对无意义
+            a, b = _pair_key(a, b)
+            c.execute("INSERT OR IGNORE INTO rejected_pairs(a_id, b_id, created_at) "
+                      "VALUES(?,?,?)", (a, b, db.now_iso()))
+        c.execute("DELETE FROM rejected_pairs WHERE a_id=? OR b_id=?", (from_id, from_id))
         c.execute("DELETE FROM entities WHERE id=?", (from_id,))
         c.commit()
     # 别名并入：from 的名字和别名都归给 into
@@ -1166,14 +1334,43 @@ def merge_entities(from_id: str, into_id: str) -> None:
     last_day = db.q1(
         "SELECT MAX(substr(e.occurred_at,1,10)) AS d FROM entity_mentions m "
         "JOIN entries e ON e.id=m.entry_id WHERE m.entity_id=?", (into_id,))["d"]
-    db.execute(
-        "UPDATE entities SET aliases_json=?, mention_count=?, "
-        "first_seen=MIN(COALESCE(first_seen, ?), ?), "
-        "last_seen=COALESCE(?, last_seen), updated_at=? WHERE id=?",
-        (json.dumps(aliases, ensure_ascii=False), count, src["first_seen"], src["first_seen"],
-         last_day, db.now_iso(), into_id),
-    )
-    logx.log("圈子：合并档案", f"《{src['name']}》并入《{dst['name']}》")
+    # A6b-03/A6b-04：顺手修正两处既有缺口——
+    # (1) first_seen 原写法 `MIN(COALESCE(first_seen, ?), ?)` 在 src 侧为 NULL/'' 时
+    #     SQLite 标量 min 返回 NULL，会把 into 的 first_seen 抹空；改为只在 src 有
+    #     合法日期时才取 min（与 last_seen 的 COALESCE 风格对称）。
+    # (2) 合并后 into 的向量是按旧名字算的，别名并入后已成脏值；置 NULL 让语义查重
+    #     回到"未建向量"状态（由回填任务重算），避免用脏向量做 0.88 静默归并判定。
+    src_first = str(src["first_seen"] or "")[:10]
+    if src_first:
+        db.execute(
+            "UPDATE entities SET aliases_json=?, mention_count=?, "
+            "first_seen=MIN(COALESCE(NULLIF(first_seen, ''), ?), ?), "
+            "last_seen=COALESCE(?, last_seen), vector_json=NULL, updated_at=? WHERE id=?",
+            (json.dumps(aliases, ensure_ascii=False), count, src_first, src_first,
+             last_day, db.now_iso(), into_id),
+        )
+    else:
+        db.execute(
+            "UPDATE entities SET aliases_json=?, mention_count=?, "
+            "last_seen=COALESCE(?, last_seen), vector_json=NULL, updated_at=? WHERE id=?",
+            (json.dumps(aliases, ensure_ascii=False), count, last_day, db.now_iso(), into_id),
+        )
+    # A3-01/A3-19：补写审计日志，让合并在「小满最近自己拿的主意」里可见、可追溯，
+    # 且 detail 里带上 from 的 id/name/facts 数量快照（原先手动合并完全无痕）。
+    # kind='entity_merge' 与自动路径的 'alias_attach' 区分开：后者可被 undo 还原别名，
+    # 前者是物理合并、无法拆分回滚（undo 会明确回 unsupported 而不是假装成功）。
+    _auto_log("merge", {
+        "kind": "entity_merge", "from_id": from_id, "from_name": src["name"],
+        "into_id": into_id, "into_name": dst["name"], "into_type": dst["type"],
+        "facts": facts_snapshot, "facts_moved": fact_stat["facts"],
+        "facts_sealed": fact_stat["sealed"], "mentions": mentions_snapshot,
+        "reason": "手动/提案合并",
+    })
+    extra = f"，迁移事实 {fact_stat['facts']} 条" if fact_stat["facts"] else ""
+    if fact_stat["sealed"]:
+        extra += f"（同项封存 {fact_stat['sealed']} 条）"
+    logx.log("圈子：合并档案",
+             f"《{src['name']}》并入《{dst['name']}》：提及 {mentions_snapshot} 条{extra}")
 
 
 # ---------------- 合并提案 ----------------
@@ -1182,8 +1379,14 @@ PROPOSE_INTERVAL = timedelta(hours=3)
 PROPOSE_MAX_PAIRS = 5
 
 
-def _shared_substring(a: str, b: str, min_len: int = 2) -> bool:
-    """规范化名有共同子串（含互相包含）。"""
+def _shared_substring(a: str, b: str, min_len: int = 3) -> bool:
+    """规范化名有共同子串（含互相包含）。
+
+    A6b-19：min_len 从 2 提到 3。中文姓名普遍共用「小/老/大/阿」等前缀与常见姓氏用字，
+    2 字连续相同极易假命中（"小王" vs "小汪"、"张伟" vs "张伟丽"），而每轮只有
+    PROPOSE_MAX_PAIRS=5 次 AI 判定预算，假候选会把预算全部吃掉，真正该合并的一对
+    当轮拿不到机会。互相包含仍照旧命中（"张伟"⊂"张伟丽" 走上面那个分支）。
+    """
     if not a or not b:
         return False
     if a in b or b in a:
@@ -1212,24 +1415,31 @@ def _proposal_exists(from_id: str, into_id: str) -> bool:
 
 
 def propose_merges(now: datetime | None = None) -> int:
-    """每轮 tick 调用；内部节流 ≥3 小时。返回新建提案数。"""
+    """每轮 tick 调用；内部节流 ≥3 小时。返回新建提案数。
+
+    A6b-06/A6b-11：节流时间戳移到所有可失败步骤**之后**——原先在候选查询与 AI 判定之前就写，
+    一次 `judge_same_entity` 异常（`break`）便把 3 小时的机会整段吃掉；且
+    `datetime.fromisoformat` 的裸 `except ValueError` 捕不到 aware−naive 的 TypeError，
+    脏值会让合并提案流程**永久停摆**。改用 _parse_ts：无法判断就当"已过期，继续执行"。
+    """
     if not enabled() or not ai_mod.fast_configured() and not ai_mod.strong_configured():
         return 0
     now = now or datetime.now().astimezone()
-    last = db.get_setting("circle_last_propose_at")
-    if last:
+    last = _parse_ts(db.get_setting("circle_last_propose_at"))
+    if last is not None:
         try:
-            if (now - datetime.fromisoformat(last)) < PROPOSE_INTERVAL:
+            if (now - last) < PROPOSE_INTERVAL:
                 return 0
-        except ValueError:
-            pass
-    db.set_setting("circle_last_propose_at", now.isoformat(timespec="seconds"))
+        except TypeError:
+            pass  # 解析不出可比时区：按"已过期"继续，不让脏值卡死提案流程
+    # 注意：这里**不**写节流键；只有本轮确实跑完（没有 AI 中断）才写（见函数末尾）。
 
     rows = db.q(
         "SELECT * FROM entities WHERE status IN ('draft','active','confirmed') "
         "AND mention_count > 0 ORDER BY mention_count DESC LIMIT 30"
     )
     if len(rows) < 2:
+        db.set_setting("circle_last_propose_at", now.isoformat(timespec="seconds"))
         return 0
 
     # 可选：嵌入向量候选
@@ -1248,8 +1458,9 @@ def propose_merges(now: datetime | None = None) -> int:
 
     created = 0
     judged = 0
+    interrupted = False
     for i in range(len(rows)):
-        if judged >= PROPOSE_MAX_PAIRS:
+        if judged >= PROPOSE_MAX_PAIRS or interrupted:
             break
         for j in range(i + 1, len(rows)):
             if judged >= PROPOSE_MAX_PAIRS:
@@ -1277,7 +1488,10 @@ def propose_merges(now: datetime | None = None) -> int:
                 verdict = ai_mod.judge_same_entity(
                     _entity_side(a, snippets_a), _entity_side(b, snippets_b))
             except Exception:
-                break  # AI 挂了本轮停
+                # AI 挂了本轮停。原写法只 break 内层 j 循环，外层继续对下一个 i 再调 AI
+                # （同一故障下反复失败），标 interrupted 让外层也停，且不消费节流键。
+                interrupted = True
+                break
             if verdict["same"] and verdict["confidence"] >= 0.8:
                 # from=提及少的一方，into=提及多的一方
                 from_row, into_row = (a, b) if a["mention_count"] <= b["mention_count"] else (b, a)
@@ -1292,6 +1506,12 @@ def propose_merges(now: datetime | None = None) -> int:
                 created += 1
                 logx.log("圈子：发现疑似重复档案",
                          f"《{from_row['name']}》和《{into_row['name']}》（{verdict['reason']}）")
+    if interrupted:
+        logx.log("圈子：合并提案本轮中断", f"AI 判定失败，已建 {created} 条，稍后重试（不消耗节流窗口）")
+    else:
+        # 本轮完整跑完才写节流键：否则一次 AI 抖动就吃掉 3 小时机会（A6b-06）。
+        # （中断时故意不写，让下个 tick 立刻重试；_proposal_exists 保证不会重复建提案。）
+        db.set_setting("circle_last_propose_at", now.isoformat(timespec="seconds"))
     return created
 
 
@@ -1384,41 +1604,48 @@ def undo_auto_action(aid: str) -> dict:
     if action == "confirm":
         eid = d.get("entity_id")
         ent = get_entity(eid) if eid else None
-        if ent is not None:
-            # 撤销 = 用户否决这次自动确认：回退 status 与 confidence 快照，
-            # 并置 auto_confirm_blocked——之后 explicit 直通与综合达标都不再自动确认（C1），
-            # 只能用户手动确认（手动路径不看这个标记）。
-            old_conf = d.get("old_confidence")
-            db.execute(
-                "UPDATE entities SET status=?, confidence=?, auto_confirm_blocked=1, "
-                "updated_at=? WHERE id=?",
-                (d.get("old_status") or "draft",
-                 float(old_conf) if old_conf is not None else ent["confidence"],
-                 now, eid),
-            )
-            logx.log("圈子：撤销自动确认",
-                     f"《{ent['name']}》回到「{d.get('old_status') or 'draft'}」，以后不再自动确认")
+        # A3-17 同源：档案已被合并/删除时，原先静默 no-op 后照样置 undone=1 并回"成功"，
+        # 用户既看不出没生效，也永久失去重试机会。同样在置位前抛错。
+        if ent is None:
+            raise ValueError("blocked")
+        # 撤销 = 用户否决这次自动确认：回退 status 与 confidence 快照，
+        # 并置 auto_confirm_blocked——之后 explicit 直通与综合达标都不再自动确认（C1），
+        # 只能用户手动确认（手动路径不看这个标记）。
+        old_conf = d.get("old_confidence")
+        db.execute(
+            "UPDATE entities SET status=?, confidence=?, auto_confirm_blocked=1, "
+            "updated_at=? WHERE id=?",
+            (d.get("old_status") or "draft",
+             float(old_conf) if old_conf is not None else ent["confidence"],
+             now, eid),
+        )
+        logx.log("圈子：撤销自动确认",
+                 f"《{ent['name']}》回到「{d.get('old_status') or 'draft'}」，以后不再自动确认")
     elif action == "merge":
-        # alias_attach 是当前唯一的自动 merge 形态（称呼挂靠，无实体拆分可言）
+        # alias_attach 是唯一可撤销的 merge 形态（称呼挂靠，摘别名即可）；kind=
+        # 'entity_merge' 是实体级物理合并，源档案及其从表行已被删除，无法拆分回滚
+        # （A6b-01/A3-19）。明确抛 unsupported，让路由如实回「这条记录无法撤销」，
+        # 而不是把 undone 置 1 假装成功、永久夺走用户的知情权。
         if d.get("kind") != "alias_attach":
             raise ValueError("unsupported")
         ent = get_entity(d.get("entity_id") or "")
         alias = d.get("alias") or ""
-        if ent is not None:
-            try:
-                aliases = json.loads(ent["aliases_json"] or "[]")
-            except ValueError:
-                aliases = []
-            kept = [a for a in aliases if norm_name(a) != norm_name(alias)]
-            db.execute("UPDATE entities SET aliases_json=?, updated_at=? WHERE id=?",
-                       (json.dumps(kept, ensure_ascii=False), now, ent["id"]))
-            # 名字维度黑名单：下一条同名记录不再被向量归并/挂靠回来（C2）。
-            # 注：该称呼已有的提及仍留在目标实体上——这是刻意的：提及是"这个名字出现过"的
-            # 证据，撤销的是"它们算同一个"的推断，不是抹掉证据（R1）。
-            if alias:
-                add_rejected_alias(ent["id"], alias)
-            logx.log("圈子：撤销自动合并",
-                     f"《{ent['name']}》摘掉了别名「{alias}」，以后不再自动并回")
+        if ent is None:
+            raise ValueError("blocked")  # 目标档案已不存在：置位前抛错，不写 undone
+        try:
+            aliases = json.loads(ent["aliases_json"] or "[]")
+        except ValueError:
+            aliases = []
+        kept = [a for a in aliases if norm_name(a) != norm_name(alias)]
+        db.execute("UPDATE entities SET aliases_json=?, updated_at=? WHERE id=?",
+                   (json.dumps(kept, ensure_ascii=False), now, ent["id"]))
+        # 名字维度黑名单：下一条同名记录不再被向量归并/挂靠回来（C2）。
+        # 注：该称呼已有的提及仍留在目标实体上——这是刻意的：提及是"这个名字出现过"的
+        # 证据，撤销的是"它们算同一个"的推断，不是抹掉证据（R1）。
+        if alias:
+            add_rejected_alias(ent["id"], alias)
+        logx.log("圈子：撤销自动合并",
+                 f"《{ent['name']}》摘掉了别名「{alias}」，以后不再自动并回")
     elif action == "fact_update":
         eid = d.get("entity_id")
         if d.get("new_fact_id"):
@@ -1442,17 +1669,25 @@ def undo_auto_action(aid: str) -> dict:
         eid = d.get("entity_id")
         ent = get_entity(eid) if eid else None
         old_type = d.get("old_type")
-        if ent is not None and old_type in ("person", "place", "event"):
-            clash = db.q1("SELECT id FROM entities WHERE type=? AND name=? AND id != ?",
-                          (old_type, ent["name"], eid))
-            if clash is None:
-                db.execute("UPDATE entities SET type=?, updated_at=? WHERE id=?",
-                           (old_type, now, eid))
-                logx.log("圈子：撤销类型纠正",
-                         f"《{ent['name']}》回到「{TYPE_LABEL.get(old_type, old_type)}」")
-            else:
-                logx.log("圈子：撤销类型纠正未执行",
-                         f"《{ent['name']}》旧类型下已有同名档案")
+        # A3-17：撤销 retype 时若旧类型下已有同名档案，原先只写一行日志「未执行」，
+        # 却继续落到下面的 undone=1 并 return 成功——接口明确告诉用户"撤销成功"，
+        # 实际什么都没撤销，且日志已置位，用户再点一次得到 400「已经撤销过了」，
+        # 永久失去重试机会。改为在置位前抛 blocked（路由按 ValueError 文案分流）。
+        if ent is None:
+            raise ValueError("blocked")  # 档案已被合并/删除：没有任何可撤销的对象
+        if old_type not in ("person", "place", "event"):
+            raise ValueError("bad snapshot")
+        clash = db.q1("SELECT id FROM entities WHERE type=? AND name=? AND id != ?",
+                      (old_type, ent["name"], eid))
+        if clash is not None:
+            # 保持 undone=0：用户把同名档案处理掉之后还能再撤一次
+            logx.log("圈子：撤销类型纠正未执行",
+                     f"《{ent['name']}》旧类型下已有同名档案，请先合并或改名")
+            raise ValueError("blocked")
+        db.execute("UPDATE entities SET type=?, updated_at=? WHERE id=?",
+                   (old_type, now, eid))
+        logx.log("圈子：撤销类型纠正",
+                 f"《{ent['name']}》回到「{TYPE_LABEL.get(old_type, old_type)}」")
     else:
         raise ValueError("unsupported")
 
@@ -1463,10 +1698,21 @@ def undo_auto_action(aid: str) -> dict:
 # ---------------- 历史追认（v3 阈值重估 + 类型复核 + draft 加速消化） ----------------
 
 RECOGNITION_MARKER = "circle_recognition_v3"  # 带版本号：将来逻辑升级可再跑一轮
+# A6b-05：中途 AI 失败不再写 marker（原先无条件写 done，一次失败即"永久完成"，
+# 剩余实体永远停在未复核状态且用户无感知）；退避 30 分钟再试，连续失败 5 次才认输。
+RECOGNITION_RETRY_KEY = "circle_recognition_retry_at"
+RECOGNITION_RETRY = timedelta(minutes=30)
+RECOGNITION_MAX_FAILS = 5
 
 
 def recognition_needed() -> bool:
-    return db.get_setting(RECOGNITION_MARKER) != "done"
+    """是否还需要跑历史追认（marker 未 done）。失败后退避期内不再重复起线程。"""
+    if db.get_setting(RECOGNITION_MARKER) == "done":
+        return False
+    retry_at = _parse_ts(db.get_setting(RECOGNITION_RETRY_KEY))
+    if retry_at is not None and datetime.now().astimezone() < retry_at:
+        return False
+    return True
 
 
 def run_recognition() -> dict:
@@ -1479,8 +1725,12 @@ def run_recognition() -> dict:
        → 改 type + auto_log('retype')；拿不准（unknown）不动。
     c) draft 加速消化：mention_count≥2 且 needs_review=0 的 draft 逐批综合（每轮 10 个，
        跑完为止），让该有关系的实体长出关系。
+
+    A6b-05：marker 改为**有条件**写入——中途 AI 失败（`break`）时保持未完成并退避重试，
+    否则一次失败就等于"永久完成"，剩余实体永远停在未复核状态且用户完全无感知。
     """
     result = {"confirmed": 0, "retyped": 0, "synthesized": 0}
+    interrupted = False
 
     if not (ai_mod.fast_configured() or ai_mod.strong_configured()):
         # AI 未配置：整体优雅跳过、不写 marker（下轮 tick 再试）；每天最多记一行日志
@@ -1516,6 +1766,7 @@ def run_recognition() -> dict:
             try:
                 verdicts = ai_mod.judge_entity_types(items)
             except Exception:
+                interrupted = True
                 break  # AI 挂了本轮停，剩下的下轮再试
             for idx, new_type in verdicts.items():
                 r = batch[idx]
@@ -1539,6 +1790,7 @@ def run_recognition() -> dict:
             try:
                 n = review_drafts(10)
             except Exception:
+                interrupted = True
                 break
             if n == 0:
                 break
@@ -1546,7 +1798,35 @@ def run_recognition() -> dict:
         if result["synthesized"]:
             logx.log("圈子：draft 加速消化", f"综合了 {result['synthesized']} 份搁置档案")
 
+    if interrupted:
+        # 不写 done：保持"未完成"，退避 30 分钟后再试（避免 AI 长期不可用时每次启动都空跑）。
+        # 连续失败达到上限才认输并写明"部分条目未复核"，不让它无声地永远重试。
+        fails = 0
+        try:
+            fails = int(db.get_setting("circle_recognition_fails") or 0)
+        except ValueError:
+            fails = 0
+        fails += 1
+        total = result["confirmed"] + result["retyped"] + result["synthesized"]
+        if fails >= RECOGNITION_MAX_FAILS:
+            db.set_setting(RECOGNITION_MARKER, "done")
+            db.set_setting("circle_recognition_fails", "0")
+            db.set_setting(RECOGNITION_RETRY_KEY, "")
+            logx.log("圈子追认未完成",
+                     f"AI 连续 {fails} 次中途失败，已放弃剩余条目（本轮完成 {total} 项）")
+            db.push_notice("圈子历史追认只跑完了一部分：AI 多次中断，可在圈子页手动再试")
+        else:
+            db.set_setting("circle_recognition_fails", str(fails))
+            nxt = datetime.now().astimezone() + RECOGNITION_RETRY
+            db.set_setting(RECOGNITION_RETRY_KEY, nxt.isoformat(timespec="seconds"))
+            logx.log("圈子追认未完成",
+                     f"AI 中途失败，{RECOGNITION_RETRY.seconds // 60} 分钟后重试"
+                     f"（第 {fails}/{RECOGNITION_MAX_FAILS} 次，本轮完成 {total} 项）")
+        return result
+
     db.set_setting(RECOGNITION_MARKER, "done")
+    db.set_setting("circle_recognition_fails", "0")
+    db.set_setting(RECOGNITION_RETRY_KEY, "")
     total = result["confirmed"] + result["retyped"] + result["synthesized"]
     logx.log("圈子追认完成", f"追认 {result['confirmed']}、纠类型 {result['retyped']}、"
                            f"综合 {result['synthesized']}")
