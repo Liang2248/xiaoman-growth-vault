@@ -335,8 +335,7 @@ def _write_stream_hashed(z: zipfile.ZipFile, arc: str, p: Path) -> tuple[str, in
     """
     h = hashlib.sha256()
     size = 0
-    big = p.stat().st_size >= 2 * 1024 * 1024 * 1024  # 超过 2GB 时强制 zip64
-    with p.open("rb") as f, z.open(arc, "w", force_zip64=big) as out:
+    with p.open("rb") as f, z.open(arc, "w") as out:
         while True:
             chunk = f.read(1024 * 1024)
             if not chunk:

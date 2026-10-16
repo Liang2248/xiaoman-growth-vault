@@ -240,6 +240,8 @@ FTS_SCHEMA_VERSION = "2"
 _FTS_VERSION_KEY = "fts_schema_version"
 # A4-11：时区迁移指纹（存的是当时的本地时区名），相同则跳过全表重写。
 _TZ_MIGRATED_KEY = "timezone_migrated_tz"
+# FTS 自愈"已判定无效"标记：避免重建后仍不生效时每次启动都白重建一次。
+_FTS_HEAL_BLOCKED_KEY = "fts_self_heal_blocked"
 # A4-04：schema 版本锚点（PRAGMA user_version）。迁移本身仍靠逐列 PRAGMA 探测（幂等），
 # 这个版本号用于给未来"只跑一次"的迁移提供判断依据，并让备份能记录当前结构版本。
 SCHEMA_VERSION = 3
@@ -749,46 +751,123 @@ def _ensure_fts() -> None:
                  f"结构校对完成，共 {_conn.execute('SELECT count(*) FROM entries_fts').fetchone()[0]} 条已索引")
 
 
+def _fts_canary_miss() -> bool:
+    """独立于 count(*) 语义的索引覆盖探测：取一条真实记录里的短片段去 MATCH。
+
+    为什么不能用 count 比对：`entries_fts` 是 `content='entries'` 的外部内容表，
+    其上的 `SELECT count(*) FROM entries_fts` 会**转去读内容表**（HANA-01 生产实测报
+    `no such column: T.tags_text` 正是这个原因），因此它恒等于 `SELECT count(*) FROM entries`，
+    完全无法反映索引是否覆盖了存量数据。这里改用"金丝雀"：从最新一条记录的某个字段里
+    取 3 个非空白非引号字符组成短语去 MATCH，搜不到就说明该记录没进索引。
+    取不到可用探针时返回 False（无法判定，不重建）。
+    """
+    row = _conn.execute(
+        "SELECT rowid, title, summary, content, tags FROM entries WHERE rowid = "
+        "(SELECT max(rowid) FROM entries)").fetchone()
+    if row is None:
+        return False  # 空库：无从探测
+    probed = False
+    for col in ("title", "summary", "content", "tags"):
+        m = re.search(r'[^\s"]{3,}', (row[col] or ""))
+        if not m:
+            continue
+        probed = True
+        phrase = '"' + m.group(0)[:3] + '"'
+        try:
+            hit = _conn.execute(
+                "SELECT 1 FROM entries_fts WHERE entries_fts MATCH ? LIMIT 1",
+                (phrase,)).fetchone()
+        except sqlite3.Error:
+            return True  # MATCH 报错 = 索引不可用
+        if hit is not None:
+            return False  # 这条记录已在索引里，索引可用
+    return probed  # 全部可用探针都搜不到 → 漏索引；没有探针 → 不判定
+
+
+def _fts_integrity_check() -> str:
+    """跑 FTS5 的 integrity-check；返回 "" 表示通过，否则返回中文原因。
+
+    先试带第二参数的形式，再回退单参数形式。两者的差别（是否连带比对外部内容表）
+    依 SQLite 版本而不同，故写成"能用哪个用哪个"：任一形式报错都视作未通过。
+    """
+    last = ""
+    for sql in ("INSERT INTO entries_fts(entries_fts, rank) VALUES('integrity-check', 1)",
+                "INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')"):
+        try:
+            _conn.execute(sql)
+            return ""
+        except sqlite3.Error as e:
+            last = str(e)
+    return f"integrity-check 未通过：{last}"
+
+
 def _fts_self_heal() -> None:
     """A4-01/B + A4-13：启动时自检 FTS 索引，发现不一致就 rebuild（幂等、低成本）。
 
-    两个探测信号：
-    1. `(SELECT count(*) FROM entries_fts)` 与 `(SELECT count(*) FROM entries)` 不一致
-       —— 历史数据从未进索引、触发器写失败都会造成这种漂移；
-    2. FTS5 官方的 `integrity-check` 命令 —— 这是唯一能发现"影子表与外部内容表不同步"
-       的手段（`PRAGMA integrity_check` 不覆盖 FTS5 虚表）。
+    两个探测信号（都**不**依赖外部内容表的 count(*) 语义）：
+    1. 金丝雀 MATCH（`_fts_canary_miss`）—— 索引没覆盖存量记录时必然命中失败；
+    2. FTS5 官方 `integrity-check`（`_fts_integrity_check`）—— 唯一能发现
+       "影子表与索引不同步"的手段（`PRAGMA integrity_check` 不覆盖 FTS5 虚表）。
+
+    另外把 `count(*) FROM entries_fts` 与 `count(*) FROM entries` 的差值只作为**日志信息**
+    记录（两者对外部内容表本就应当相等，不构成判据）。
     """
     with _lock:
         try:
-            indexed = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
+            if get_setting(_FTS_HEAL_BLOCKED_KEY):
+                return  # 上次判定自动重建无效，不再每次启动白重建
+            try:
+                indexed = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
+            except sqlite3.Error:
+                indexed = -1
             live = _conn.execute("SELECT count(*) FROM entries").fetchone()[0]
-            broken = indexed != live
-            reason = f"索引 {indexed} 条 ≠ 记录 {live} 条"
+            broken = False
+            reason = ""
+            if live and _fts_canary_miss():
+                broken, reason = True, "金丝雀匹配失败：索引未覆盖存量记录"
             if not broken:
-                try:
-                    _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
-                except sqlite3.Error as e:
-                    broken, reason = True, f"integrity-check 未通过：{e}"
+                err = _fts_integrity_check()
+                if err:
+                    broken, reason = True, err
             if broken:
                 _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
                 _conn.commit()
-                logx.log("全文索引已自愈", f"{reason}，已重建")
+                after = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
+                # 重建后复核一次：若金丝雀仍失败，说明不是"索引没建"而是别的原因，
+                # 打上标记后不再每次启动都重建（避免陷入每启动一次重建的死循环）。
+                if live and _fts_canary_miss():
+                    set_setting(_FTS_HEAL_BLOCKED_KEY, "1")
+                    logx.log("全文索引自愈未生效", "重建后仍无法覆盖存量记录，已停止自动重建；"
+                                                    "搜索仍走 LIKE 兜底，可在诊断页查看")
+                else:
+                    set_setting(_FTS_HEAL_BLOCKED_KEY, "")
+                    logx.log("全文索引已自愈", f"{reason}，已重建（索引 {after} 条 / 记录 {live} 条）")
+            elif indexed != live:
+                # 外部内容表下两者本应相等；不等只记日志，不据此重建（避免误判）
+                logx.log("全文索引条数与记录数不一致", f"索引 {indexed} 条 / 记录 {live} 条（仅记录，不据此重建）")
         except sqlite3.Error as e:
             # 自愈失败不影响启动：search_rowids 仍有 LIKE 兜底。
             logx.log("全文索引自检未通过", f"{e}")
 
 
 def fts_status() -> dict:
-    """A4-12/A4-13：把全文索引状态暴露给诊断接口（设置页/健康检查用）。"""
+    """A4-12/A4-13：把全文索引状态暴露给诊断接口（设置页/健康检查用）。
+
+    注意 `indexed`（`count(*) FROM entries_fts`）在外部内容表下等于记录数，
+    不具备诊断价值，这里同时给出真正有意义的 `canary_ok` 与 `integrity` 结论。
+    """
     if not fts_enabled:
         return {"enabled": False, "detail": "FTS5 不可用，3 字以上查询走 LIKE"}
     with _lock:
         try:
-            indexed = _conn.execute("SELECT count(*) FROM entries_fts").fetchone()[0]
             live = _conn.execute("SELECT count(*) FROM entries").fetchone()[0]
-            _conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
-            return {"enabled": True, "indexed": indexed, "entries": live,
-                    "consistent": indexed == live}
+            canary_ok = not (live and _fts_canary_miss())
+            integrity = _fts_integrity_check()
+            return {"enabled": True, "entries": live,
+                    "canary_ok": canary_ok,
+                    "integrity_ok": not integrity,
+                    "consistent": bool(canary_ok and not integrity),
+                    "detail": integrity or ("索引覆盖正常" if canary_ok else "索引未覆盖存量记录")}
         except sqlite3.Error as e:
             return {"enabled": True, "consistent": False, "detail": str(e)}
 
@@ -852,27 +931,38 @@ def close() -> None:
 
 
 def purge_orphan_rows() -> dict:
-    """A4-08：清理引用已硬删记录的孤儿行（启动时调用，幂等）。
+    """A4-08 + R1-10：清理引用已硬删记录的孤儿行（启动时调用，幂等）。
 
-    knowledge/entity_mentions/entry_categories/link_proposals 四张表引用 entries 却没有
-    外键级联（新库已补 REFERENCES，老库 SQLite 不支持 ALTER ADD CONSTRAINT），
-    main.purge_old_deleted 硬删记录后它们会留下孤儿：entity_mentions 的孤儿会把
-    entities.mention_count 抬高，link_proposals 的孤儿会在关联列表里显示"（记录已删除）"。
+    knowledge/entity_mentions/entry_categories/link_proposals/circle_questions 引用 entries
+    却没有外键级联（老库 SQLite 不支持 ALTER ADD CONSTRAINT），main.purge_old_deleted 硬删
+    记录后它们会留下孤儿：entity_mentions 的孤儿会把 entities.mention_count 抬高，
+    link_proposals 的孤儿会在关联列表里显示"（记录已删除）"，circle_questions 的孤儿提问卡
+    会指向不存在的记录，entry_embeddings 的孤儿向量会继续参与语义检索。
+
+    处置口径（保守，与 purge_old_deleted 一致）：
+    - 派生于记录、无独立内容价值的行 → DELETE（entity_mentions / entry_categories /
+      link_proposals / entry_embeddings）；
+    - 自身有内容价值、entry_id 只是"来源指针"的 → 置 NULL，保留本体
+      （knowledge.entry_id / circle_questions.entry_id / entity_facts.source_entry_id）。
     """
     counts: dict[str, int] = {}
     with locked() as c:
-        for table in ("entity_mentions", "entry_categories", "link_proposals"):
+        # 纯派生的孤儿行：直接删
+        for table in ("entity_mentions", "entry_categories", "link_proposals", "entry_embeddings"):
             # 用 NOT EXISTS 而不是 NOT IN：NOT IN 遇到子查询里的 NULL 会整体变成"无匹配"
             # （静默不清理），NOT EXISTS 语义确定。
             cur = c.execute(
                 f"DELETE FROM {table} WHERE entry_id IS NOT NULL "
                 f"AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = {table}.entry_id)")
             counts[table] = max(cur.rowcount, 0)
-        # knowledge.entry_id 是"来源记录"软引用：只清空悬空指针，不删知识条目本身。
-        cur = c.execute(
-            "UPDATE knowledge SET entry_id=NULL WHERE entry_id IS NOT NULL "
-            "AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = knowledge.entry_id)")
-        counts["knowledge_entry_id_nulled"] = max(cur.rowcount, 0)
+        # 悬空"来源指针"：只置空，不删本体
+        for table, col in (("knowledge", "entry_id"),
+                           ("circle_questions", "entry_id"),
+                           ("entity_facts", "source_entry_id")):
+            cur = c.execute(
+                f"UPDATE {table} SET {col}=NULL WHERE {col} IS NOT NULL "
+                f"AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = {table}.{col})")
+            counts[f"{table}.{col}_nulled"] = max(cur.rowcount, 0)
     if any(counts.values()):
         logx.log("已清理孤儿数据行", "、".join(f"{k} {v} 行" for k, v in counts.items() if v))
     return counts
@@ -949,7 +1039,9 @@ def set_setting(key: str, value: str) -> None:
 
 
 def set_settings(values: dict[str, str]) -> None:
-    """一次事务写入一组设置，供切换 AI 供应商等不可拆分操作使用。"""
+    """一次事务写入一组设置，供切换 AI 供应商等不可拆分操作使用。
+
+    R1-07：不再在块内显式 c.commit()——提交由 locked() 托管，块内提交会与外层事务语义冲突。"""
     if not values:
         return
     with locked() as c:
@@ -958,7 +1050,6 @@ def set_settings(values: dict[str, str]) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [(key, str(value)) for key, value in values.items()],
         )
-        c.commit()
 
 
 # ---------------- 多供应商 AI 配置 ----------------

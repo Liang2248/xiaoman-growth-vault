@@ -571,6 +571,7 @@ def _migrate_child_facts(c, from_id: str, into_id: str) -> dict:
     会造出同一 predicate 两条 `valid_to IS NULL` 的活跃值，破坏 temporal.py 依赖的
     「同 predicate 至多一个活跃值」不变式。按 (valid_from, created_at) 保留最新一条，
     其余封存；封存日取保留者的生效日，并保证不早于被封存者自身的生效日（防倒挂）。
+    任一方 `valid_from` 为空的行不参与收口（R2-01，见下方注释）。
 
     返回快照 `{"facts": 迁移条数, "sealed": 收口封存条数}`，供调用方写审计日志。
     """
@@ -582,7 +583,6 @@ def _migrate_child_facts(c, from_id: str, into_id: str) -> dict:
     if not moved:
         return {"facts": 0, "sealed": 0}
     c.execute("UPDATE entity_facts SET entity_id=? WHERE entity_id=?", (into_id, from_id))
-    today = db.now_iso()[:10]
     active = c.execute(
         "SELECT id, predicate, valid_from, created_at FROM entity_facts "
         "WHERE entity_id=? AND valid_to IS NULL "
@@ -597,9 +597,14 @@ def _migrate_child_facts(c, from_id: str, into_id: str) -> dict:
             keep[pred] = str(f["valid_from"] or "")
             continue
         own_from = str(f["valid_from"] or "")
-        end = keep[pred] or today
-        if own_from and end < own_from:
-            end = own_from
+        # R2-01：空 valid_from 的行**不参与收口**。空串在 ORDER BY valid_from DESC 里排最后，
+        # 一旦拿它当"非最新"去封存，就会把刚迁入的（或来源不明的）事实误封存，且封存日会
+        # 退化成今天——比不封存更糟。只对"双方都有明确日期"的行做收口，方向才可靠。
+        if not own_from or not keep[pred]:
+            continue
+        end = keep[pred]
+        if end < own_from:
+            end = own_from  # 防倒挂
         c.execute("UPDATE entity_facts SET valid_to=? WHERE id=?", (end, f["id"]))
         sealed += 1
     return {"facts": moved, "sealed": sealed}

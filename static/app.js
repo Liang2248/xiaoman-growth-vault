@@ -2027,7 +2027,6 @@
   var flushingAt = 0;
   var FLUSH_STALE_MS = 5 * 60 * 1000; // 软锁：一次冲刷超过 5 分钟视为已死，释放锁
   var OUTBOX_MAX_ATTEMPTS = 5;        // 超过阈值的条目移到「同步失败」，不再阻塞队列
-  var outboxFailedCount = 0;          // 同步失败（需人工处理）的条数，chip 上分开显示
 
   async function updateSyncChip() {
     var slot = $('#sync-slot');
@@ -2039,7 +2038,6 @@
     } catch (e) {
       n = await outbox.count();
     }
-    outboxFailedCount = failed;
     if (!document.body.contains(slot)) return;
     // A7-24：await 期间队列可能已变化，用 count 结果渲染前再做一次存在性 + 状态校验
     if (flushing) {
@@ -2070,12 +2068,16 @@
     if (flushing && Date.now() - flushingAt < FLUSH_STALE_MS) return;
     flushing = true;
     flushingAt = Date.now();
-    var done = 0, failed = 0, stoppedByNetwork = false;
+    var done = 0, stoppedByNetwork = false;
     try {
       var items = await outbox.all();
       items.sort(function (a, b) { return a.id - b.id; });
       for (var i = 0; i < items.length; i++) {
         var it = items[i];
+        // R2-04：已判死信的条目彻底跳过。此前只打了 it.failed 标记却仍在每轮重试，
+        // 「不再阻塞队列」只做了一半——一条结构上永远失败的记录会持续 POST / 重传附件。
+        // 这些条目仍留在 IDB 里（chip 会显示「N 条同步失败」），只是不再自动重试。
+        if (it.failed) { continue; }
         // A7-01：创建成功后立刻回写 entry_id —— 重试时据此跳过 POST，
         // 避免「记录已建成、附件失败」的条目每轮重复插入一条新记录。
         var entryId = it.entry_id || null;
@@ -2132,7 +2134,6 @@
           it.last_tried_at = new Date().toISOString();
           if (it.attempts >= OUTBOX_MAX_ATTEMPTS) {
             it.failed = true;
-            failed++;
             try { await outbox.put(it); } catch (e2) { /* 忽略 */ }
             toast('有 1 条记录同步不了（' + e.message + '），已跳过，不影响其它记录', 'error', 6000);
           } else {

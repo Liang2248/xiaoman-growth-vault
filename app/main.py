@@ -52,9 +52,6 @@ DEFAULT_PORT = 52122
 MEDIA_INLINE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif",
                      ".mp4", ".m4v", ".mov", ".webm",
                      ".mp3", ".m4a", ".wav", ".ogg", ".flac"}
-MEDIA_INLINE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
-                      "image/avif", "video/mp4", "video/webm", "video/quicktime",
-                      "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/flac"}
 
 # A1-21：FTS/LIKE 召回的候选上限（原为 500）。命中数达到上限时响应带 truncated=True，
 # 不再让前端把"最多 500"当成真实总数。
@@ -129,11 +126,9 @@ def purge_old_deleted(days: int = 30) -> None:
         removed = 0
         for eid in targets:
             try:
-                files = []
                 with db.locked() as c:
-                    for a in c.execute("SELECT path, thumb FROM attachments WHERE entry_id=?",
-                                       (eid,)):
-                        files.append((a["path"], a["thumb"]))
+                    files = [(a["path"], a["thumb"]) for a in c.execute(
+                        "SELECT path, thumb FROM attachments WHERE entry_id=?", (eid,))]
                     # A1-16：受影响实体的 mention_count 是冗余计数器，删提及后必须回落
                     affected = [m["entity_id"] for m in c.execute(
                         "SELECT DISTINCT entity_id FROM entity_mentions WHERE entry_id=?", (eid,))]
@@ -147,22 +142,28 @@ def purge_old_deleted(days: int = 30) -> None:
                                         (ent_id,)).fetchone()["n"]
                         c.execute("UPDATE entities SET mention_count=? WHERE id=?", (cnt, ent_id))
                     c.execute("DELETE FROM entries WHERE id=?", (eid,))
-                removed += 1
-                # 物理文件最后删：仍被别的附件行引用（sha256 去重共用）时不动
-                for rel, thumb in files:
-                    for root, value, col in ((db.MEDIA_DIR, rel, "path"),
-                                             (db.THUMBS_DIR, thumb, "thumb")):
-                        if not value:
-                            continue
-                        try:
-                            if db.q1(f"SELECT COUNT(*) AS n FROM attachments WHERE {col}=?",
-                                     (value,))["n"]:
+                    # R1-08：引用计数与 unlink 必须在同一个临界区内完成。
+                    # 原先"锁外先查 COUNT(*) 再 unlink"是典型 check-then-act：查询与删除之间
+                    # 若另一线程刚插入引用同一 sha256 的附件行（mediafiles 的去重复用），
+                    # 就会把仍被引用的物理文件删掉。该路径低频，锁内做文件 IO 可接受。
+                    for rel, thumb in files:
+                        for root, value, col in ((db.MEDIA_DIR, rel, "path"),
+                                                 (db.THUMBS_DIR, thumb, "thumb")):
+                            if not value:
                                 continue
-                            p = _resolve_under(root, value)
-                            if p is not None:
-                                p.unlink(missing_ok=True)
-                        except Exception as e:
-                            logx.log("回收站文件清理失败", f"{str(value)[:40]}：{e}（不影响记录删除）")
+                            try:
+                                refs = c.execute(
+                                    f"SELECT COUNT(*) AS n FROM attachments WHERE {col}=?",
+                                    (value,)).fetchone()["n"]
+                                if refs:
+                                    continue  # 仍被别的附件行引用：不动物理文件
+                                p = _resolve_under(root, value)
+                                if p is not None:
+                                    p.unlink(missing_ok=True)
+                            except Exception as e:
+                                logx.log("回收站文件清理失败",
+                                         f"{str(value)[:40]}：{e}（不影响记录删除）")
+                removed += 1
             except Exception as e:
                 logx.log("回收站清理单条失败", f"{str(eid)[:8]}：{type(e).__name__}: {e}")
         if removed:
@@ -738,9 +739,33 @@ def _embed_worker(entry_id: str) -> None:
         pass
 
 
+# R1-09：异步向量重建的在途上限（详见 _maybe_embed_async 的说明）
+_EMBED_SEMAPHORE = threading.BoundedSemaphore(4)
+
+
 def _maybe_embed_async(entry_id: str) -> None:
-    if ai_mod.embed_configured():
-        threading.Thread(target=_embed_worker, args=(entry_id,), daemon=True).start()
+    """恢复记录后重建向量（异步）。
+
+    R1-09：原先每次调用都起一个裸线程、无上限；批量恢复（Agent 脚本/连续操作）会同时起
+    几十上百个线程各自等外部嵌入接口。这里用 BoundedSemaphore(4) 限制在途数量：
+    拿不到许可就直接跳过本次异步重建——调度器的向量滴灌会兜住（它按 batch 补缺失向量），
+    所以"跳过"不会让记录永久缺向量，只是不在这一刻抢资源。
+    """
+    if not ai_mod.embed_configured():
+        return
+    if not _EMBED_SEMAPHORE.acquire(blocking=False):
+        return  # 在途已满：交给后台滴灌兜底，不排队堆积
+
+    def _run() -> None:
+        try:
+            _embed_worker(entry_id)
+        finally:
+            try:
+                _EMBED_SEMAPHORE.release()
+            except ValueError:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _write_entry_categories(entry_id: str, slugs: list, source: str = "ai") -> int:
@@ -3760,10 +3785,36 @@ def healthz():
 
 
 @app.get("/api/diagnostics/fts")
-def diagnostics_fts():
+def diagnostics_fts(fix: int = 0):
     """A4-12/A4-13：全文索引诊断——为什么降级、索引条数是否与记录数一致。
 
-    `fix=1` 时顺带执行一次 rebuild（幂等）。"""
+    R1-05：docstring 一直承诺 `fix=1` 时 rebuild，但函数原本没有参数、从不实现。
+    现在补上并真正执行重建：
+    - 有公开入口时优先用（`db.repair_fts` / `db.fts_rebuild`，为 F1a 将来提供留口）；
+    - 否则在 `db.locked()` 临界区内直接执行 FTS5 官方的 `rebuild` 命令——
+      用公开的 `db.locked()` 而不是 `db._ensure_fts()`，因为后者只在 `init_db()` 持锁时调用，
+      从请求线程裸调它会在无锁状态下重建索引（与并发读写冲突）。
+    """
+    if fix:
+        if not getattr(db, "fts_enabled", True):
+            raise HTTPException(400, "全文检索当前不可用（FTS5 未启用），无法重建")
+        try:
+            for name in ("repair_fts", "fts_rebuild"):
+                fn = getattr(db, name, None)
+                if callable(fn):
+                    fn()
+                    break
+            else:
+                # 无公开重建入口：在 db.locked() 内执行 FTS5 的 rebuild（幂等，可重跑）
+                with db.locked() as c:
+                    c.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+        except Exception as e:
+            logx.log("全文索引手动重建失败", f"{type(e).__name__}: {str(e)[:120]}")
+            raise HTTPException(500, "重建全文索引失败，请查看日志")
+        logx.log("全文索引已手动重建", "已执行 rebuild")
+        status = db.fts_status()
+        status["repaired"] = True
+        return status
     return db.fts_status()
 
 
@@ -4693,33 +4744,19 @@ def circle_merge(body: MergeIn):
     src = circle_mod.get_entity(body.from_id)
     dst = circle_mod.get_entity(body.into_id)
     if src is None or dst is None:
-        raise HTTPException(404, "档案不存在")
+        # R1-13：合并入口的 404 文案更可操作——档案不存在最常见的原因是被别的路径合并掉了
+        raise HTTPException(404, "档案已被合并或不存在，请刷新")
     if src["type"] != dst["type"]:
         raise HTTPException(400, "只能合并同类型档案（人物/地点/事件），跨类型请改用「编辑类型」")
-    # A3-01：merge_entities 本体在 circle.py（属 F4 批次），main.py 侧能做的是——
-    # (1) 合并前统计将被并入的事实条数并在响应里如实告知；
-    # (2) 若源档案还有事实，写一条明确的风险告警日志。
-    # 背景：entity_facts 是 ON DELETE CASCADE，而 merge_entities 只迁移 mentions/relations
-    # 就 DELETE FROM entities，源档案的全部时序事实会被静默级联删除（不可恢复）。
-    # 待 F4 在 circle.py 的 merge_entities 事务里补
-    # "UPDATE entity_facts SET entity_id=:into WHERE entity_id=:from" + 同 predicate 去重收口。
-    facts_to_move = db.q1("SELECT COUNT(*) AS n FROM entity_facts WHERE entity_id=?",
-                          (body.from_id,))["n"]
-    mentions_to_move = db.q1("SELECT COUNT(*) AS n FROM entity_mentions WHERE entity_id=?",
-                             (body.from_id,))["n"]
+    # A3-01/R1-03：原先这里统计"将被并入的事实条数"并告警"事实将被静默丢弃"。
+    # F4 已在 circle.py 的 merge_entities 事务内用 _migrate_child_facts 实现事实迁移
+    # （同 predicate 去重收口），该告警已成过期假信息，且 merged_facts_dropped 字段无消费者。
+    # 合并规模由 circle.py 的 "圈子：合并档案" 日志如实记录（含提及/事实/封存条数），此处不再重复。
     try:
         circle_mod.merge_entities(body.from_id, body.into_id)
     except ValueError:
-        raise HTTPException(404, "档案不存在")
-    if facts_to_move:
-        # 不阻断合并（产品语义允许合并），但必须留下可追溯的告警，而不是静默丢数据
-        logx.log("圈子：合并将丢弃源档案时序事实",
-                 f"《{src['name']}》→《{dst['name']}》：{facts_to_move} 条事实"
-                 f"（entity_facts 无迁移，见 F4 待修）；提及 {mentions_to_move} 条已迁移")
-    result = _entity_detail(body.into_id)
-    if facts_to_move:
-        result["merged_facts_dropped"] = facts_to_move  # 如实告知，供前端提示
-    return result
+        raise HTTPException(404, "档案已被合并或不存在，请刷新")
+    return _entity_detail(body.into_id)
 
 
 @app.get("/api/circle/graph")
@@ -5429,54 +5466,83 @@ def index():
     raise HTTPException(404, "前端文件 static/index.html 不存在")
 
 
-# A1-15：媒体原件改为经路由输出并校验所属记录状态。
-# 原先 /media 是裸静态挂载：软删（回收站）记录的照片/证据仍可按 URL 长期访问——
+# A1-15 / R1-04：媒体原件与缩略图都改为经路由输出并校验所属记录状态。
+# 原先 /media 与 /thumbs 都是裸静态挂载：软删（回收站）记录的照片/证据仍可按 URL 长期访问——
 # "移入回收站"在用户心智里等于删除，实际语义只是从列表隐藏，URL 一旦被分享/缓存就还在。
-# 这里按 attachments.path 反查所属记录，已软删（回收站）的一律 404。
-# 结果做进程内小缓存（路径 → 允许与否 + 时间戳），避免相册页每张图都查库（A1-08 的教训）。
+# 这里分别按 attachments.path / attachments.thumb 反查所属记录，已软删（回收站）的一律 404。
+# 结果做进程内小缓存（缓存键 = 请求路径 → 允许与否 + 时间戳），避免相册页每张图都查库（A1-08 的教训）。
 _MEDIA_GUARD_CACHE: dict[str, tuple[bool, float]] = {}
 _MEDIA_GUARD_LOCK = threading.Lock()
 MEDIA_GUARD_TTL = 5.0
 
 
-@app.get("/media/{path:path}", include_in_schema=False)
-def media_file(path: str):
+def _media_allowed(cache_key: str, sql: str, params: tuple) -> bool:
+    """媒体访问守卫：命中进程内缓存则直接返回，否则查一次库并写缓存。"""
     now = time.time()
     with _MEDIA_GUARD_LOCK:
-        cached = _MEDIA_GUARD_CACHE.get(path)
+        cached = _MEDIA_GUARD_CACHE.get(cache_key)
         if cached is not None and now - cached[1] < MEDIA_GUARD_TTL:
-            allowed = cached[0]
-        else:
-            allowed = None
-    if allowed is None:
-        row = db.q1(
-            "SELECT e.deleted_at, e.exclude_from_ai FROM attachments a "
-            "JOIN entries e ON e.id = a.entry_id WHERE a.path=?", (path,))
-        allowed = bool(row is not None and not row["deleted_at"])
-        with _MEDIA_GUARD_LOCK:
-            if len(_MEDIA_GUARD_CACHE) > 4000:
-                _MEDIA_GUARD_CACHE.clear()
-            _MEDIA_GUARD_CACHE[path] = (allowed, now)
-    if not allowed:
-        raise HTTPException(404, "文件不存在")
-    # 目录包含校验：path 来自 URL，必须确认没有逃出媒体目录
-    p = _resolve_under(db.MEDIA_DIR, path)
-    if p is None or not p.is_file():
-        raise HTTPException(404, "文件不存在")
-    ext = p.suffix.lower()
-    resp = FileResponse(p, media_type=mimetypes.guess_type(p.name)[0] or "application/octet-stream")
+            return cached[0]
+    row = db.q1(sql, params)
+    # 所属记录必须存在且未软删（attribute 缺失时 row 为 None → 拒绝）
+    allowed = bool(row is not None and not row["deleted_at"])
+    with _MEDIA_GUARD_LOCK:
+        if len(_MEDIA_GUARD_CACHE) > 4000:
+            _MEDIA_GUARD_CACHE.clear()
+        _MEDIA_GUARD_CACHE[cache_key] = (allowed, now)
+    return allowed
+
+
+def _media_response(path_obj: Path) -> FileResponse:
+    """统一的媒体响应：nosniff + CSP sandbox + 非白名单扩展名强制下载（A1-02）。"""
+    ext = path_obj.suffix.lower()
+    resp = FileResponse(path_obj,
+                        media_type=mimetypes.guess_type(path_obj.name)[0]
+                        or "application/octet-stream")
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
     if ext not in MEDIA_INLINE_EXTS:
-        # A1-02：非白名单扩展名（.html/.svg/.htm/.xhtml…）一律作为附件下载，
+        # 非白名单扩展名（.html/.svg/.htm/.xhtml…）一律作为附件下载，
         # 绝不在应用自身源上内联执行。
         resp.headers["Content-Disposition"] = "attachment"
     return resp
 
 
+@app.get("/media/{path:path}", include_in_schema=False)
+def media_file(path: str):
+    if not _media_allowed(
+            f"/media/{path}",
+            "SELECT e.deleted_at FROM attachments a "
+            "JOIN entries e ON e.id = a.entry_id WHERE a.path=?", (path,)):
+        raise HTTPException(404, "文件不存在")
+    # 目录包含校验：path 来自 URL，必须确认没有逃出媒体目录
+    p = _resolve_under(db.MEDIA_DIR, path)
+    if p is None or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    return _media_response(p)
+
+
+@app.get("/thumbs/{name:path}", include_in_schema=False)
+def thumb_file(name: str):
+    """R1-04：缩略图同样要过软删守卫。
+
+    /thumbs 原先是裸 StaticFiles 挂载，A1-15 只修了 /media，于是"记录已移入回收站"
+    但缩略图仍可按 `data/thumbs/<sha256>.jpg` 访问（URL 可猜且被浏览器缓存过）。
+    attachments.thumb 存的就是扁平文件名 `<sha256>.jpg`，因此按该列反查所属记录。
+    """
+    if not _media_allowed(
+            f"/thumbs/{name}",
+            "SELECT e.deleted_at FROM attachments a "
+            "JOIN entries e ON e.id = a.entry_id WHERE a.thumb=?", (name,)):
+        raise HTTPException(404, "文件不存在")
+    p = _resolve_under(db.THUMBS_DIR, name)
+    if p is None or not p.is_file():
+        raise HTTPException(404, "文件不存在")
+    return _media_response(p)
+
+
 db.ensure_dirs()  # 挂载静态目录前确保存在
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-app.mount("/thumbs", StaticFiles(directory=db.THUMBS_DIR), name="thumbs")
 
 
 if __name__ == "__main__":

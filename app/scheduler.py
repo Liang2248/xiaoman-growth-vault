@@ -527,16 +527,25 @@ def send_push(title: str, content: str) -> tuple[bool, str]:
         if provider == "Server酱":
             if body.get("code") == 0:
                 return True, "推送成功"
-            return False, f"Server酱返回 code={body.get('code')}：{str(body.get('message') or '')[:60]}"
+            return False, f"Server酱返回 code={body.get('code')}：{_redact_push_msg(body.get('message'), key)}"
         code = body.get("code")
         if str(code) == "200":
             return True, "推送成功"
-        return False, f"PushPlus返回 code={code}：{str(body.get('msg') or '')[:60]}"
+        return False, f"PushPlus返回 code={code}：{_redact_push_msg(body.get('msg'), key)}"
     except httpx.TimeoutException:
         return False, "推送超时，请检查网络"
     except Exception as e:
-        # 脱敏：httpx 的异常字符串可能带上完整 URL（内含 Server酱的 key path）
+        # R2-09/A6b-13 脱敏：httpx 的异常字符串可能带上完整 URL（内含 Server酱的 key path），
+        # 而这段文案会经 POST /api/settings/test-push 回到前端。只回类型名，不回原文。
         return False, f"推送失败：{type(e).__name__}"
+
+
+def _redact_push_msg(raw, key: str) -> str:
+    """上游响应里的错误说明：剥掉可能回显的 key，压成单行并截断（R2-09 脱敏）。"""
+    text = str(raw or "").replace("\n", " ").replace("\r", " ").strip()
+    if key and key in text:
+        text = text.replace(key, "***")
+    return text[:60]
 
 
 def _build_daily_review(today: date) -> str:
@@ -812,25 +821,33 @@ def _maybe_morning_push(now: datetime) -> None:
 # ---------------- 圈子：档案综合与复查 ----------------
 
 def _maybe_circle(now: datetime) -> None:
-    """每轮：综合有新提及的实体（≤3），再复查搁置档案（≤2）。全部静默。"""
+    """每轮：综合有新提及的实体（≤3），再复查搁置档案（≤2）。
+
+    R2-06：原先两处 `except Exception: pass` 全静默，与 A6b-08"消灭调度静默"的意图不一致
+    ——单条实体综合失败时用户既看不到日志，也不知道圈子为什么没进展。改为各记一行（带
+    异常类型），仍保持"一步失败不影响另一步"。
+    """
     from . import circle as circle_mod  # 延迟导入避免循环
     try:
         circle_mod.synthesize_due(3)
-    except Exception:
-        pass
+    except Exception as e:
+        logx.log("圈子调度失败：档案综合",
+                 f"{type(e).__name__}: {str(e)[:80]}")
     try:
         circle_mod.review_drafts(2)
-    except Exception:
-        pass
+    except Exception as e:
+        logx.log("圈子调度失败：搁置复查",
+                 f"{type(e).__name__}: {str(e)[:80]}")
 
 
 def _maybe_propose_merges(now: datetime) -> None:
-    """合并提案（内部 3 小时节流，全静默）。"""
+    """合并提案（内部 3 小时节流）。R2-06：失败不再静默，记一行日志。"""
     from . import circle as circle_mod  # 延迟导入避免循环
     try:
         circle_mod.propose_merges(now)
-    except Exception:
-        pass
+    except Exception as e:
+        logx.log("圈子调度失败：合并提案",
+                 f"{type(e).__name__}: {str(e)[:80]}")
 
 
 # ---------------- 历史分类迁移（is_work + AI 多标签） ----------------

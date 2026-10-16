@@ -381,7 +381,10 @@ def chat(messages: list, timeout: float = 180.0, slot: str = "strong", attempts:
             elif isinstance(last, httpx.ConnectError):
                 last_error = AIError(f"无法连接到 AI 接口（已自动重试 {tries} 次），请检查 base_url 是否填写正确")
             else:
-                last_error = AIError(f"网络请求失败（已自动重试 {tries} 次仍被中断）：{last}")
+                # 异常原文只进本地日志（脱敏、截断），客户端只拿类型名（R2-08/A5-05）。
+                logx.log("AI 接口错误详情",
+                         f"网络层异常（{base_url}）{type(last).__name__} {_redact(str(last)[:200])}")
+                last_error = AIError(f"网络请求失败（{type(last).__name__}，已自动重试 {tries} 次仍被中断）")
             continue
 
         # 限流与上游抖动：退避后重试，耗尽本家候选的尝试次数再换下一家。
@@ -422,7 +425,9 @@ def chat(messages: list, timeout: float = 180.0, slot: str = "strong", attempts:
                 r = _post_chat(base_url, key, payload, timeout)
                 downgraded = True
             except httpx.HTTPError as e:
-                last_error = AIError(f"网络请求失败：{e}")
+                logx.log("AI 接口错误详情",
+                         f"降级重试网络异常（{base_url}）{type(e).__name__} {_redact(str(e)[:200])}")
+                last_error = AIError(f"网络请求失败（{type(e).__name__}）")
                 continue
 
         if r.status_code != 200:
@@ -501,7 +506,10 @@ def test_chat_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
     except httpx.ConnectError:
         return False, "无法连接到接口，请检查 Base URL 是否填写正确"
     except httpx.HTTPError as e:
-        return False, f"网络请求失败：{e}"
+        # 异常原文只进本地日志，前端只拿类型名（R2-08/A5-05）。
+        logx.log("AI 探测接口错误详情",
+                 f"对话模型网络异常（{base_url}）{type(e).__name__} {_redact(str(e)[:200])}")
+        return False, f"网络请求失败（{type(e).__name__}）"
 
 
 def test_embed_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
@@ -523,7 +531,10 @@ def test_embed_with(base_url: str, key: str, model: str) -> tuple[bool, str]:
     except httpx.ConnectError:
         return False, "无法连接到接口，请检查 Base URL 是否填写正确"
     except httpx.HTTPError as e:
-        return False, f"网络请求失败：{e}"
+        # 异常原文只进本地日志，前端只拿类型名（R2-08/A5-05）。
+        logx.log("AI 探测接口错误详情",
+                 f"嵌入模型网络异常（{base_url}）{type(e).__name__} {_redact(str(e)[:200])}")
+        return False, f"网络请求失败（{type(e).__name__}）"
 
 
 # ---------------- JSON 解析与修复 ----------------
