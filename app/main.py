@@ -332,8 +332,12 @@ def _setup_required_response(request: Request) -> Response:
 
 
 # A1-32：豁免用精确匹配 + 带斜杠前缀，避免 /api/authanything、/staticfoo 被前缀误放行
-EXEMPT_PREFIXES = ("/api/agent/", "/api/auth/")
-EXEMPT_EXACT = {"/api/auth", "/api/healthz"}
+# R1-02：页面壳与前端资源必须先于鉴权加载——锁屏 UI 由 /static/app.js 渲染，
+# 若不豁免，无 cookie 的浏览器打开页面只会得到 401 JSON，锁屏永远无法出现
+# （服务端会话过期/换浏览器后必然触发）。静态资源不含用户数据；
+# 数据类 API、/media、/thumbs 仍全部要求 cookie。
+EXEMPT_PREFIXES = ("/api/agent/", "/api/auth/", "/static/")
+EXEMPT_EXACT = {"/api/auth", "/api/healthz", "/"}
 
 
 @app.middleware("http")
@@ -342,8 +346,9 @@ async def access_lock(request: Request, call_next):
 
     - 未设访问口令（A1-01）：默认只允许本机（回环）访问，局域网设备得到 403 引导先设置口令；
       /api/agent/*（自带 Bearer 鉴权）与 /api/healthz 不受此限。
-    - 已设访问口令：除 /api/agent/*、/api/auth、/api/healthz 外，
-      页面/静态/API/媒体都需要合法 cookie xm_auth，否则 401 {"detail":"locked"}。
+    - 已设访问口令：除页面壳（/）、/static/*、/api/agent/*、/api/auth、/api/healthz 外，
+      API/媒体都需要合法 cookie xm_auth，否则 401 {"detail":"locked"}；
+      前端加载后对首个 401 弹出锁屏（R1-02：页面壳与静态资源可公开加载，数据仍全部受保护）。
     """
     path = request.url.path
     expect = _auth_token()

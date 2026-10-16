@@ -4983,7 +4983,8 @@
       var ok = await confirmModal('重新生成后，旧令牌将立即失效，确定吗？', '重新生成');
       if (!ok) return;
       try {
-        var r = await api('/api/settings', { method: 'PUT', body: { regenerate_agent_token: true } });
+        // R1-01：重新生成时显式要求当次回显明文（服务端仅此响应返回一次），否则令牌无法获取
+        var r = await api('/api/settings', { method: 'PUT', body: { regenerate_agent_token: true, reveal_agent_token: true } });
         var fresh = r && typeof r.agent_token === 'string' ? r.agent_token : '';
         if (!fresh) {
           // 后端已改为不回明文：只更新状态文案
